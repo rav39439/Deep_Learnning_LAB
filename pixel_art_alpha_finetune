@@ -1,3 +1,26 @@
+# ============================================================
+# PIXART-ALPHA FINE-TUNING ON FLICKR30K
+# Optimized for a 14.56 GB CUDA GPU
+#
+# Stage 1: T5 GPU -> cache text embeddings -> release T5
+# Stage 2: VAE GPU -> cache image latents -> release VAE
+# Stage 3: PixArt GPU -> fine-tune transformer
+#
+# Dataset:
+# 30 unique images
+# 20 training images
+# 5 validation images
+# 5 unused images
+#
+# Trainable:
+# Last 2 transformer blocks + output projection
+# ============================================================
+
+
+# ============================================================
+# 1. IMPORTS
+# ============================================================
+
 import os
 import gc
 import json
@@ -22,944 +45,12 @@ from transformers import (
 from diffusers import (
     PixArtTransformer2DModel,
     AutoencoderKL,
-    DPMSolverMultistepScheduler,
     DDPMScheduler
 )
 
 
 # ============================================================
-# 1. CONFIGURATION
-# ============================================================
-
-MODEL_NAME = "PixArt-alpha/PixArt-XL-2-512x512"
-
-# Flickr30k dataset directory
-# result.csv and flickr30k_images are inside this directory.
-DATASET_ROOT = "/kaggle/input/datasets/hsankesara/flickr-image-dataset/flickr30k_images"
-
-IMAGE_ROOT = os.path.join(
-    DATASET_ROOT,
-    "flickr30k_images"
-)
-
-
-CAPTION_PATH = os.path.join(
-    DATASET_ROOT,
-    "results.csv"
-)
-OUTPUT_DIR = "/kaggle/working/pixart_finetuned"
-
-IMAGE_SIZE = 512
-
-MAX_LENGTH = 120
-
-BATCH_SIZE = 1
-
-NUM_EPOCHS = 5
-
-LEARNING_RATE = 1e-5
-
-WEIGHT_DECAY = 0.01
-
-NUM_TRAINABLE_BLOCKS = 8
-
-GRAD_ACCUMULATION = 4
-
-VALIDATION_RATIO = 0.05
-
-CAPTION_DROPOUT = 0.10
-
-NUM_WORKERS = 2
-
-SEED = 42
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-WEIGHT_DTYPE = torch.float16
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-
-torch.backends.cuda.matmul.allow_tf32 = True
-
-if DEVICE != "cuda":
-    raise RuntimeError(
-        "GPU is required for PixArt fine-tuning."
-    )
-
-if not os.path.isdir(IMAGE_ROOT):
-    raise FileNotFoundError(
-        f"Image directory not found: {IMAGE_ROOT}"
-    )
-
-if not os.path.isfile(CAPTION_PATH):
-    raise FileNotFoundError(
-        f"Caption file not found: {CAPTION_PATH}"
-    )
-
-print("Device:", DEVICE)
-print("Dataset root:", DATASET_ROOT)
-print("Image directory:", IMAGE_ROOT)
-print("Caption file:", CAPTION_PATH)
-
-
-# ============================================================
-# 2. IMAGE TRANSFORMS
-# ============================================================
-
-train_transform = transforms.Compose([
-
-    transforms.Resize(
-        IMAGE_SIZE,
-        interpolation=transforms.InterpolationMode.BILINEAR
-    ),
-
-    transforms.RandomCrop(IMAGE_SIZE),
-
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ToTensor(),
-
-    transforms.Normalize(
-        [0.5, 0.5, 0.5],
-        [0.5, 0.5, 0.5]
-    )
-
-])
-
-
-validation_transform = transforms.Compose([
-
-    transforms.Resize(
-        IMAGE_SIZE,
-        interpolation=transforms.InterpolationMode.BILINEAR
-    ),
-
-    transforms.CenterCrop(IMAGE_SIZE),
-
-    transforms.ToTensor(),
-
-    transforms.Normalize(
-        [0.5, 0.5, 0.5],
-        [0.5, 0.5, 0.5]
-    )
-
-])
-
-
-# ============================================================
-# 3. FLICKR30K DATASET
-# ============================================================
-
-class FlickrImageDataset(Dataset):
-
-    def __init__(
-        self,
-        image_root,
-        transform=None,
-        dataframe=None
-    ):
-
-        self.image_root = image_root
-        self.transform = transform
-
-        if dataframe is None:
-
-            # Flickr30k result.csv format:
-            #
-            # image_name | comment_number | comment
-            #
-            # Example:
-            # 1000092795.jpg | 0 | Two young guys...
-            #
-            # It is pipe-separated, NOT comma-separated.
-
-            self.df = pd.read_csv(
-                CAPTION_PATH,
-                sep="|",
-                encoding="utf-8",
-                dtype=str,
-                skipinitialspace=True
-            )
-
-            # Remove whitespace from column names.
-            self.df.columns = [
-                str(col).strip()
-                for col in self.df.columns
-            ]
-
-            # Normalize column names.
-            self.df = self.df.rename(
-                columns={
-                    "image_name": "image",
-                    "comment_number": "caption_number",
-                    "comment": "caption"
-                }
-            )
-
-        else:
-
-            self.df = dataframe.copy()
-
-        required_columns = {
-            "image",
-            "caption"
-        }
-
-        if not required_columns.issubset(
-            self.df.columns
-        ):
-
-            raise ValueError(
-                "Unexpected result.csv format. "
-                f"Found columns: {self.df.columns.tolist()}"
-            )
-
-        # Clean image filenames and captions.
-
-        self.df["image"] = (
-            self.df["image"]
-            .astype(str)
-            .str.strip()
-        )
-
-        self.df["caption"] = (
-            self.df["caption"]
-            .astype(str)
-            .str.strip()
-        )
-
-        # Remove missing values.
-
-        self.df = self.df.dropna(
-            subset=["image", "caption"]
-        )
-
-        self.df = self.df[
-            (self.df["image"] != "") &
-            (self.df["caption"] != "") &
-            (self.df["image"].str.lower() != "nan") &
-            (self.df["caption"].str.lower() != "nan")
-        ].reset_index(drop=True)
-
-        # Keep only records with existing JPG images.
-
-        self.df = self.df[
-            self.df["image"].apply(
-                lambda name: os.path.isfile(
-                    os.path.join(
-                        self.image_root,
-                        name
-                    )
-                )
-            )
-        ].reset_index(drop=True)
-
-        print(
-            "Valid image-caption pairs:",
-            len(self.df)
-        )
-
-        print(
-            "Unique images:",
-            self.df["image"].nunique()
-        )
-
-    def __len__(self):
-
-        return len(self.df)
-
-    def __getitem__(self, index):
-
-        row = self.df.iloc[index]
-
-        image_name = row["image"]
-
-        caption = row["caption"]
-
-        image_path = os.path.join(
-            self.image_root,
-            image_name
-        )
-
-        with Image.open(image_path) as img:
-
-            image = img.convert("RGB")
-
-        if self.transform is not None:
-
-            image = self.transform(image)
-
-        return {
-            "pixel_values": image,
-            "caption": caption
-        }
-
-
-# ============================================================
-# 4. LOAD DATASET
-# ============================================================
-
-full_dataset = FlickrImageDataset(
-    image_root=IMAGE_ROOT,
-    transform=None
-)
-
-if len(full_dataset) < 2:
-
-    raise ValueError(
-        "Dataset contains insufficient valid image-caption pairs."
-    )
-
-print("\nSample annotations:")
-
-print(
-    full_dataset.df.head()
-)
-
-
-# ============================================================
-# 5. TRAIN / VALIDATION SPLIT BY UNIQUE IMAGE
-# ============================================================
-
-unique_images = (
-    full_dataset.df["image"]
-    .unique()
-    .tolist()
-)
-
-generator = torch.Generator().manual_seed(
-    SEED
-)
-
-permutation = torch.randperm(
-    len(unique_images),
-    generator=generator
-).tolist()
-
-num_val_images = max(
-    1,
-    int(len(unique_images) * VALIDATION_RATIO)
-)
-
-val_images = set(
-    unique_images[i]
-    for i in permutation[:num_val_images]
-)
-
-# All captions of an image remain in the same split.
-
-train_df = full_dataset.df[
-    ~full_dataset.df["image"].isin(val_images)
-].reset_index(drop=True)
-
-val_df = full_dataset.df[
-    full_dataset.df["image"].isin(val_images)
-].reset_index(drop=True)
-
-
-# Create datasets with separate transformations.
-
-train_dataset = FlickrImageDataset(
-    image_root=IMAGE_ROOT,
-    transform=train_transform,
-    dataframe=train_df
-)
-
-validation_dataset = FlickrImageDataset(
-    image_root=IMAGE_ROOT,
-    transform=validation_transform,
-    dataframe=val_df
-)
-
-print("\nDataset split completed")
-
-print("Training pairs:", len(train_dataset))
-
-print("Validation pairs:", len(validation_dataset))
-
-print(
-    "Training unique images:",
-    train_dataset.df["image"].nunique()
-)
-
-print(
-    "Validation unique images:",
-    validation_dataset.df["image"].nunique()
-)
-
-
-# ============================================================
-# 6. DATALOADERS
-# ============================================================
-
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=NUM_WORKERS,
-    pin_memory=True,
-    drop_last=True
-)
-
-validation_loader = DataLoader(
-    validation_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=NUM_WORKERS,
-    pin_memory=True
-)
-
-if len(train_loader) == 0:
-
-    raise ValueError(
-        "No training batches available."
-    )
-
-
-# ============================================================
-# 7. LOAD PRETRAINED COMPONENTS
-# ============================================================
-
-print("\nLoading T5 tokenizer...")
-
-tokenizer = T5Tokenizer.from_pretrained(
-    MODEL_NAME,
-    subfolder="tokenizer"
-)
-
-
-print("Loading T5 text encoder...")
-
-text_encoder = T5EncoderModel.from_pretrained(
-    MODEL_NAME,
-    subfolder="text_encoder",
-    torch_dtype=WEIGHT_DTYPE
-).to(DEVICE)
-
-
-print("Loading VAE...")
-
-vae = AutoencoderKL.from_pretrained(
-    MODEL_NAME,
-    subfolder="vae",
-    torch_dtype=WEIGHT_DTYPE
-).to(DEVICE)
-
-
-print("Loading PixArt transformer...")
-
-transformer = PixArtTransformer2DModel.from_pretrained(
-    MODEL_NAME,
-    subfolder="transformer",
-    torch_dtype=WEIGHT_DTYPE
-).to(DEVICE)
-
-
-# ============================================================
-# 8. TRAINING NOISE SCHEDULER
-# ============================================================
-
-inference_scheduler = DPMSolverMultistepScheduler.from_pretrained(
-    MODEL_NAME,
-    subfolder="scheduler"
-)
-
-noise_scheduler = DDPMScheduler.from_config(
-    inference_scheduler.config
-)
-
-del inference_scheduler
-
-gc.collect()
-
-
-# ============================================================
-# 9. FREEZE T5 AND VAE
-# ============================================================
-
-text_encoder.requires_grad_(False)
-
-vae.requires_grad_(False)
-
-text_encoder.eval()
-
-vae.eval()
-
-
-# ============================================================
-# 10. FREEZE PIXART TRANSFORMER
-# ============================================================
-
-transformer.requires_grad_(False)
-
-blocks = transformer.transformer_blocks
-
-total_blocks = len(blocks)
-
-print("\nTotal transformer blocks:", total_blocks)
-
-if NUM_TRAINABLE_BLOCKS > total_blocks:
-
-    raise ValueError(
-        "NUM_TRAINABLE_BLOCKS exceeds available transformer blocks."
-    )
-
-
-# Train only the last 8 transformer blocks.
-
-for block in blocks[-NUM_TRAINABLE_BLOCKS:]:
-
-    for param in block.parameters():
-
-        param.requires_grad = True
-
-
-# Train output projection.
-
-for param in transformer.proj_out.parameters():
-
-    param.requires_grad = True
-
-
-# Convert trainable parameters to FP32.
-
-for param in transformer.parameters():
-
-    if param.requires_grad:
-
-        param.data = param.data.float()
-
-
-# ============================================================
-# 11. PARAMETER SUMMARY
-# ============================================================
-
-total_parameters = sum(
-    p.numel()
-    for p in transformer.parameters()
-)
-
-trainable_parameters = sum(
-    p.numel()
-    for p in transformer.parameters()
-    if p.requires_grad
-)
-
-print("\nTotal parameters:", f"{total_parameters:,}")
-
-print("Trainable parameters:", f"{trainable_parameters:,}")
-
-print(
-    "Trainable percentage:",
-    f"{100 * trainable_parameters / total_parameters:.2f}%"
-)
-
-
-# ============================================================
-# 12. OPTIMIZER
-# ============================================================
-
-trainable_params = [
-    p
-    for p in transformer.parameters()
-    if p.requires_grad
-]
-
-optimizer = torch.optim.AdamW(
-    trainable_params,
-    lr=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY,
-    betas=(0.9, 0.999)
-)
-
-scaler = torch.cuda.amp.GradScaler()
-
-transformer.enable_gradient_checkpointing()
-
-
-# ============================================================
-# 13. TEXT EMBEDDING
-# ============================================================
-
-def encode_captions(captions):
-
-    tokens = tokenizer(
-        captions,
-        padding="max_length",
-        max_length=MAX_LENGTH,
-        truncation=True,
-        return_tensors="pt"
-    )
-
-    input_ids = tokens.input_ids.to(DEVICE)
-
-    attention_mask = tokens.attention_mask.to(DEVICE)
-
-    with torch.no_grad():
-
-        embeddings = text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        ).last_hidden_state
-
-    return embeddings, attention_mask
-
-
-# ============================================================
-# 14. DIFFUSION TRAINING LOSS
-# ============================================================
-
-def calculate_loss(batch, training=True):
-
-    images = batch["pixel_values"].to(
-        DEVICE,
-        dtype=WEIGHT_DTYPE,
-        non_blocking=True
-    )
-
-    captions = batch["caption"]
-
-    # Caption dropout.
-
-    if training:
-
-        captions = [
-            "" if random.random() < CAPTION_DROPOUT
-            else caption
-            for caption in captions
-        ]
-
-
-    # --------------------------------------------------------
-    # A. VAE IMAGE ENCODING
-    # --------------------------------------------------------
-
-    with torch.no_grad():
-
-        with torch.autocast(
-            device_type="cuda",
-            dtype=WEIGHT_DTYPE
-        ):
-
-            latents = vae.encode(
-                images
-            ).latent_dist.sample()
-
-            latents = (
-                latents * vae.config.scaling_factor
-            )
-
-
-    # --------------------------------------------------------
-    # B. TEXT ENCODING
-    # --------------------------------------------------------
-
-    text_embeddings, attention_mask = encode_captions(
-        captions
-    )
-
-    text_embeddings = text_embeddings.to(
-        dtype=WEIGHT_DTYPE
-    )
-
-
-    # --------------------------------------------------------
-    # C. RANDOM GAUSSIAN NOISE
-    # --------------------------------------------------------
-
-    noise = torch.randn_like(latents)
-
-    batch_size = latents.shape[0]
-
-
-    # --------------------------------------------------------
-    # D. RANDOM TIMESTEPS
-    # --------------------------------------------------------
-
-    timesteps = torch.randint(
-        0,
-        noise_scheduler.config.num_train_timesteps,
-        (batch_size,),
-        device=DEVICE
-    ).long()
-
-
-    # --------------------------------------------------------
-    # E. ADD NOISE TO LATENTS
-    # --------------------------------------------------------
-
-    noisy_latents = noise_scheduler.add_noise(
-        latents,
-        noise,
-        timesteps
-    )
-
-
-    # --------------------------------------------------------
-    # F. TARGET
-    # --------------------------------------------------------
-
-    prediction_type = (
-        noise_scheduler.config.prediction_type
-    )
-
-    if prediction_type == "epsilon":
-
-        target = noise
-
-    elif prediction_type == "v_prediction":
-
-        target = noise_scheduler.get_velocity(
-            latents,
-            noise,
-            timesteps
-        )
-
-    else:
-
-        raise ValueError(
-            f"Unsupported prediction type: {prediction_type}"
-        )
-
-
-    # --------------------------------------------------------
-    # G. PIXART FORWARD PASS
-    # --------------------------------------------------------
-
-    with torch.autocast(
-        device_type="cuda",
-        dtype=WEIGHT_DTYPE
-    ):
-
-        model_output = transformer(
-            hidden_states=noisy_latents,
-            timestep=timesteps,
-            encoder_hidden_states=text_embeddings,
-            encoder_attention_mask=attention_mask
-        ).sample
-
-        # PixArt output contains noise and variance channels.
-        # Use the noise prediction channels.
-
-        predicted_noise = model_output.chunk(
-            2,
-            dim=1
-        )[0]
-
-
-    # --------------------------------------------------------
-    # H. MSE LOSS
-    # --------------------------------------------------------
-
-    loss = F.mse_loss(
-        predicted_noise.float(),
-        target.float(),
-        reduction="mean"
-    )
-
-    return loss
-
-
-# ============================================================
-# 15. VALIDATION
-# ============================================================
-
-@torch.no_grad()
-
-def validate():
-
-    transformer.eval()
-
-    total_loss = 0.0
-
-    count = 0
-
-    for batch in tqdm(
-        validation_loader,
-        desc="Validation"
-    ):
-
-        loss = calculate_loss(
-            batch,
-            training=False
-        )
-
-        total_loss += loss.item()
-
-        count += 1
-
-    transformer.train()
-
-    return total_loss / max(count, 1)
-
-
-# ============================================================
-# 16. TRAINING
-# ============================================================
-
-history = {
-    "train_loss": [],
-    "validation_loss": []
-}
-
-
-for epoch in range(NUM_EPOCHS):
-
-    transformer.train()
-
-    optimizer.zero_grad(set_to_none=True)
-
-    total_loss = 0.0
-
-    progress = tqdm(
-        enumerate(train_loader),
-        total=len(train_loader),
-        desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}"
-    )
-
-    for step, batch in progress:
-
-        loss = calculate_loss(
-            batch,
-            training=True
-        )
-
-        total_loss += loss.item()
-
-        scaled_loss = loss / GRAD_ACCUMULATION
-
-        scaler.scale(scaled_loss).backward()
-
-        should_update = (
-            (step + 1) % GRAD_ACCUMULATION == 0
-            or (step + 1) == len(train_loader)
-        )
-
-        if should_update:
-
-            scaler.unscale_(optimizer)
-
-            torch.nn.utils.clip_grad_norm_(
-                trainable_params,
-                max_norm=1.0
-            )
-
-            scaler.step(optimizer)
-
-            scaler.update()
-
-            optimizer.zero_grad(set_to_none=True)
-
-        progress.set_postfix(
-            loss=f"{loss.item():.5f}"
-        )
-
-    train_loss = total_loss / max(
-        len(train_loader),
-        1
-    )
-
-    validation_loss = validate()
-
-    history["train_loss"].append(train_loss)
-
-    history["validation_loss"].append(validation_loss)
-
-    print(f"\nEpoch: {epoch + 1}")
-
-    print(f"Training Loss: {train_loss:.6f}")
-
-    print(f"Validation Loss: {validation_loss:.6f}")
-
-
-    # Save after each epoch.
-
-    epoch_dir = os.path.join(
-        OUTPUT_DIR,
-        f"epoch_{epoch + 1}"
-    )
-
-    os.makedirs(
-        epoch_dir,
-        exist_ok=True
-    )
-
-    transformer.save_pretrained(
-        epoch_dir,
-        safe_serialization=True
-    )
-
-    print("Saved:", epoch_dir)
-
-
-# ============================================================
-# 17. SAVE FINAL TRANSFORMER
-# ============================================================
-
-transformer.save_pretrained(
-    OUTPUT_DIR,
-    safe_serialization=True
-)
-
-with open(
-    os.path.join(
-        OUTPUT_DIR,
-        "training_history.json"
-    ),
-    "w"
-) as f:
-
-    json.dump(
-        history,
-        f,
-        indent=4
-    )
-
-
-print("\nFine-tuning completed!")
-
-print("Saved model:", OUTPUT_DIR)
-
-print("Training history:", history)
-
-
-3-----------------------------------------------------------------------------------------------
-
-
-import os
-import gc
-import json
-import random
-import numpy as np
-import pandas as pd
-from PIL import Image
-from tqdm.auto import tqdm
-
-import torch
-import torch.nn.functional as F
-
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-
-from transformers import (
-    T5Tokenizer,
-    T5EncoderModel
-)
-
-from diffusers import (
-    PixArtTransformer2DModel,
-    AutoencoderKL,
-    DPMSolverMultistepScheduler,
-    DDPMScheduler
-)
-
-
-# ============================================================
-# 1. CONFIGURATION
+# 2. CONFIGURATION
 # ============================================================
 
 MODEL_NAME = "PixArt-alpha/PixArt-XL-2-512x512"
@@ -974,95 +65,268 @@ IMAGE_ROOT = os.path.join(
     "flickr30k_images"
 )
 
-CAPTION_PATH = os.path.join(
+CAPTION_FILE = os.path.join(
     DATASET_ROOT,
     "results.csv"
 )
 
 OUTPUT_DIR = "/kaggle/working/pixart_finetuned"
 
-IMAGE_SIZE = 512
+TRANSFORMER_OUTPUT_DIR = os.path.join(
+    OUTPUT_DIR,
+    "transformer"
+)
 
-MAX_LENGTH = 120
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+IMAGE_SIZE = 512
+MAX_TEXT_LENGTH = 120
+
+MAX_IMAGES = 30
+TRAIN_IMAGES = 20
+VALIDATION_IMAGES = 5
 
 BATCH_SIZE = 1
-
-NUM_EPOCHS = 5
+EPOCHS = 5
 
 LEARNING_RATE = 1e-5
-
 WEIGHT_DECAY = 0.01
 
-NUM_TRAINABLE_BLOCKS = 8
-
-GRAD_ACCUMULATION = 4
-
-VALIDATION_RATIO = 0.05
+GRADIENT_ACCUMULATION_STEPS = 4
 
 CAPTION_DROPOUT = 0.10
 
-NUM_WORKERS = 2
+NUM_TRAINABLE_BLOCKS = 2
+
+NUM_WORKERS = 0
 
 SEED = 42
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-WEIGHT_DTYPE = torch.float16
+USE_FP16 = DEVICE.type == "cuda"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(TRANSFORMER_OUTPUT_DIR, exist_ok=True)
 
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
+
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 torch.backends.cuda.matmul.allow_tf32 = True
-
-if DEVICE != "cuda":
-    raise RuntimeError("GPU is required for PixArt fine-tuning.")
-
-if not os.path.isdir(IMAGE_ROOT):
-    raise FileNotFoundError(
-        f"Image directory not found: {IMAGE_ROOT}"
-    )
-
-if not os.path.isfile(CAPTION_PATH):
-    raise FileNotFoundError(
-        f"Caption file not found: {CAPTION_PATH}"
-    )
+torch.backends.cudnn.allow_tf32 = True
 
 print("Device:", DEVICE)
 print("Dataset root:", DATASET_ROOT)
 print("Image directory:", IMAGE_ROOT)
-print("Caption file:", CAPTION_PATH)
+print("Caption file:", CAPTION_FILE)
 
 
 # ============================================================
-# 2. IMAGE TRANSFORMS
+# 3. GPU MEMORY UTILITIES
 # ============================================================
 
-train_transform = transforms.Compose([
+def clear_memory():
 
-    transforms.Resize(
-        IMAGE_SIZE,
-        interpolation=transforms.InterpolationMode.BILINEAR
-    ),
+    gc.collect()
 
-    transforms.RandomCrop(IMAGE_SIZE),
+    if torch.cuda.is_available():
 
-    transforms.RandomHorizontalFlip(p=0.5),
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
-    transforms.ToTensor(),
 
-    transforms.Normalize(
-        [0.5, 0.5, 0.5],
-        [0.5, 0.5, 0.5]
+def print_gpu_memory(title):
+
+    if not torch.cuda.is_available():
+        return
+
+    torch.cuda.synchronize()
+
+    allocated = (
+        torch.cuda.memory_allocated() / 1024**3
     )
 
-])
+    reserved = (
+        torch.cuda.memory_reserved() / 1024**3
+    )
+
+    free, total = torch.cuda.mem_get_info()
+
+    free = free / 1024**3
+    total = total / 1024**3
+
+    print(f"\n{title}")
+    print(f"GPU total:     {total:.2f} GB")
+    print(f"GPU free:      {free:.2f} GB")
+    print(f"GPU allocated: {allocated:.2f} GB")
+    print(f"GPU reserved:  {reserved:.2f} GB\n")
 
 
-validation_transform = transforms.Compose([
+# ============================================================
+# 4. LOAD AND FILTER FLICKR30K DATASET
+# ============================================================
+
+class FlickrImageDataset:
+
+    def __init__(
+        self,
+        image_root,
+        caption_file,
+        max_images=30
+    ):
+
+        self.image_root = image_root
+
+        if not os.path.exists(caption_file):
+            raise FileNotFoundError(
+                f"Caption file not found: {caption_file}"
+            )
+
+        if not os.path.isdir(image_root):
+            raise FileNotFoundError(
+                f"Image directory not found: {image_root}"
+            )
+
+        df = pd.read_csv(
+            caption_file,
+            sep="|",
+            skipinitialspace=True
+        )
+
+        df.columns = [
+            str(column).strip()
+            for column in df.columns
+        ]
+
+        required_columns = {
+            "image_name",
+            "comment"
+        }
+
+        if not required_columns.issubset(df.columns):
+            raise ValueError(
+                f"Expected columns: {required_columns}. "
+                f"Found: {list(df.columns)}"
+            )
+
+        df = df[
+            ["image_name", "comment"]
+        ].copy()
+
+        df["image_name"] = (
+            df["image_name"]
+            .astype(str)
+            .str.strip()
+        )
+
+        df["comment"] = (
+            df["comment"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        df = df[
+            (df["image_name"] != "") &
+            (df["comment"] != "")
+        ]
+
+        # Select only the first 30 unique image names.
+        # Avoid checking every image in the full CSV.
+
+        unique_names = (
+            df["image_name"]
+            .drop_duplicates()
+            .tolist()
+        )
+
+        selected_names = unique_names[:max_images]
+
+        valid_names = []
+
+        for image_name in selected_names:
+
+            image_path = os.path.join(
+                image_root,
+                image_name
+            )
+
+            if os.path.isfile(image_path):
+                valid_names.append(image_name)
+
+        if not valid_names:
+            raise RuntimeError(
+                "No valid images found. Check IMAGE_ROOT."
+            )
+
+        self.df = df[
+            df["image_name"].isin(valid_names)
+        ].reset_index(drop=True)
+
+        self.image_names = valid_names
+
+        print("\nDataset loaded successfully")
+        print("Unique images:", len(self.image_names))
+        print("Caption rows:", len(self.df))
+
+
+full_dataset = FlickrImageDataset(
+    image_root=IMAGE_ROOT,
+    caption_file=CAPTION_FILE,
+    max_images=MAX_IMAGES
+)
+
+
+# ============================================================
+# 5. TRAIN / VALIDATION SPLIT
+# ============================================================
+
+unique_images = full_dataset.image_names.copy()
+
+random.shuffle(unique_images)
+
+train_images = unique_images[:TRAIN_IMAGES]
+
+validation_images = unique_images[
+    TRAIN_IMAGES:
+    TRAIN_IMAGES + VALIDATION_IMAGES
+]
+
+unused_images = unique_images[
+    TRAIN_IMAGES + VALIDATION_IMAGES:
+]
+
+train_df = full_dataset.df[
+    full_dataset.df["image_name"].isin(train_images)
+].reset_index(drop=True)
+
+validation_df = full_dataset.df[
+    full_dataset.df["image_name"].isin(validation_images)
+].reset_index(drop=True)
+
+print("\nDataset split")
+print("Training images:", len(train_images))
+print("Validation images:", len(validation_images))
+print("Unused images:", len(unused_images))
+
+print("Training captions:", len(train_df))
+print("Validation captions:", len(validation_df))
+
+if not len(train_df) or not len(validation_df):
+    raise RuntimeError(
+        "Training or validation dataset is empty."
+    )
+
+
+# ============================================================
+# 6. IMAGE TRANSFORM
+# ============================================================
+
+image_transform = transforms.Compose([
 
     transforms.Resize(
         IMAGE_SIZE,
@@ -1081,108 +345,258 @@ validation_transform = transforms.Compose([
 ])
 
 
+def load_image(image_name):
+
+    image_path = os.path.join(
+        IMAGE_ROOT,
+        image_name
+    )
+
+    with Image.open(image_path) as image:
+
+        image = image.convert("RGB")
+
+        return image_transform(image)
+
+
 # ============================================================
-# 3. FLICKR30K DATASET
+# 7. COLLECT UNIQUE CAPTIONS
 # ============================================================
 
-class FlickrImageDataset(Dataset):
+all_captions = (
+    pd.concat([
+        train_df["comment"],
+        validation_df["comment"]
+    ])
+    .drop_duplicates()
+    .tolist()
+)
+
+# Include empty prompt for classifier-free caption dropout.
+
+all_captions.append("")
+
+all_captions = list(
+    dict.fromkeys(all_captions)
+)
+
+print("\nUnique captions:", len(all_captions))
+
+
+# ============================================================
+# 8. STAGE 1: LOAD T5 ON GPU
+# ============================================================
+
+print("\nLoading T5 text encoder...")
+
+clear_memory()
+print_gpu_memory("Before loading T5")
+
+tokenizer = T5Tokenizer.from_pretrained(
+    MODEL_NAME,
+    subfolder="tokenizer"
+)
+
+text_encoder = T5EncoderModel.from_pretrained(
+    MODEL_NAME,
+    subfolder="text_encoder",
+    torch_dtype=(
+        torch.float16 if USE_FP16 else torch.float32
+    )
+)
+
+text_encoder.to(DEVICE)
+text_encoder.eval()
+
+text_encoder.requires_grad_(False)
+
+print("T5 loaded on:", DEVICE)
+
+print_gpu_memory("After loading T5")
+
+
+# ============================================================
+# 9. PRECOMPUTE TEXT EMBEDDINGS
+# ============================================================
+
+text_embedding_cache = {}
+
+print("\nGenerating caption embeddings...")
+
+with torch.inference_mode():
+
+    for caption in tqdm(all_captions):
+
+        tokens = tokenizer(
+            caption,
+            max_length=MAX_TEXT_LENGTH,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        input_ids = tokens.input_ids.to(DEVICE)
+
+        attention_mask = (
+            tokens.attention_mask.to(DEVICE)
+        )
+
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=USE_FP16
+        ):
+
+            outputs = text_encoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+
+        embedding = outputs.last_hidden_state
+
+        text_embedding_cache[caption] = (
+            embedding[0]
+            .detach()
+            .cpu()
+            .to(torch.float16)
+        )
+
+        text_mask = (
+            attention_mask[0]
+            .detach()
+            .cpu()
+            .to(torch.long)
+        )
+
+        # Save mask with the caption embedding.
+        text_embedding_cache[caption] = (
+            text_embedding_cache[caption],
+            text_mask
+        )
+
+
+print("Text embeddings cached:", len(text_embedding_cache))
+
+
+# ============================================================
+# 10. RELEASE T5 GPU MEMORY
+# ============================================================
+
+del text_encoder
+del tokenizer
+
+clear_memory()
+
+print_gpu_memory(
+    "After releasing T5"
+)
+
+
+# ============================================================
+# 11. STAGE 2: LOAD VAE ON GPU
+# ============================================================
+
+print("\nLoading VAE...")
+
+vae = AutoencoderKL.from_pretrained(
+    MODEL_NAME,
+    subfolder="vae",
+    torch_dtype=(
+        torch.float16 if USE_FP16 else torch.float32
+    )
+)
+
+vae.to(DEVICE)
+vae.eval()
+
+vae.requires_grad_(False)
+
+print("VAE loaded on:", DEVICE)
+
+print_gpu_memory("After loading VAE")
+
+
+# ============================================================
+# 12. PRECOMPUTE IMAGE LATENTS
+# ============================================================
+
+latent_cache = {}
+
+all_selected_images = (
+    train_images + validation_images
+)
+
+print("\nGenerating image latents...")
+
+with torch.inference_mode():
+
+    for image_name in tqdm(all_selected_images):
+
+        image_tensor = load_image(
+            image_name
+        ).unsqueeze(0).to(DEVICE)
+
+        with torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16,
+            enabled=USE_FP16
+        ):
+
+            encoded = vae.encode(
+                image_tensor
+            )
+
+            latent = encoded.latent_dist.sample()
+
+            latent = (
+                latent * vae.config.scaling_factor
+            )
+
+        latent_cache[image_name] = (
+            latent[0]
+            .detach()
+            .cpu()
+            .to(torch.float16)
+        )
+
+        del image_tensor
+        del encoded
+        del latent
+
+
+print("Cached image latents:", len(latent_cache))
+
+
+# ============================================================
+# 13. RELEASE VAE GPU MEMORY
+# ============================================================
+
+del vae
+
+clear_memory()
+
+print_gpu_memory(
+    "After releasing VAE"
+)
+
+
+# ============================================================
+# 14. CACHED TRAINING DATASET
+# ============================================================
+
+class CachedPixArtDataset(Dataset):
 
     def __init__(
         self,
-        image_root,
-        transform=None,
-        dataframe=None
+        dataframe,
+        latent_cache,
+        text_cache
     ):
 
-        self.image_root = image_root
-        self.transform = transform
+        self.df = dataframe.reset_index(drop=True)
 
-        if dataframe is None:
-
-            self.df = pd.read_csv(
-                CAPTION_PATH,
-                sep="|",
-                encoding="utf-8",
-                dtype=str,
-                skipinitialspace=True
-            )
-
-            self.df.columns = [
-                str(col).strip()
-                for col in self.df.columns
-            ]
-
-            self.df = self.df.rename(
-                columns={
-                    "image_name": "image",
-                    "comment_number": "caption_number",
-                    "comment": "caption"
-                }
-            )
-
-        else:
-
-            self.df = dataframe.copy()
-
-        required_columns = {
-            "image",
-            "caption"
-        }
-
-        if not required_columns.issubset(
-            self.df.columns
-        ):
-
-            raise ValueError(
-                "Unexpected results.csv format. "
-                f"Found columns: {self.df.columns.tolist()}"
-            )
-
-        self.df["image"] = (
-            self.df["image"]
-            .astype(str)
-            .str.strip()
-        )
-
-        self.df["caption"] = (
-            self.df["caption"]
-            .astype(str)
-            .str.strip()
-        )
-
-        self.df = self.df.dropna(
-            subset=["image", "caption"]
-        )
-
-        self.df = self.df[
-            (self.df["image"] != "") &
-            (self.df["caption"] != "") &
-            (self.df["image"].str.lower() != "nan") &
-            (self.df["caption"].str.lower() != "nan")
-        ].reset_index(drop=True)
-
-        # Keep only image-caption pairs with existing images.
-
-        self.df = self.df[
-            self.df["image"].apply(
-                lambda name: os.path.isfile(
-                    os.path.join(
-                        self.image_root,
-                        name
-                    )
-                )
-            )
-        ].reset_index(drop=True)
-
-        print(
-            "Valid image-caption pairs:",
-            len(self.df)
-        )
-
-        print(
-            "Unique images:",
-            self.df["image"].nunique()
-        )
+        self.latent_cache = latent_cache
+        self.text_cache = text_cache
 
     def __len__(self):
 
@@ -1192,217 +606,43 @@ class FlickrImageDataset(Dataset):
 
         row = self.df.iloc[index]
 
-        image_name = row["image"]
+        image_name = row["image_name"]
+        caption = row["comment"]
 
-        caption = row["caption"]
-
-        image_path = os.path.join(
-            self.image_root,
+        latent = self.latent_cache[
             image_name
+        ]
+
+        text_embedding, attention_mask = (
+            self.text_cache[caption]
         )
 
-        with Image.open(image_path) as img:
-
-            image = img.convert("RGB")
-
-        if self.transform is not None:
-
-            image = self.transform(image)
-
-        return {
-            "pixel_values": image,
-            "caption": caption
-        }
+        return (
+            latent,
+            text_embedding,
+            attention_mask
+        )
 
 
-# ============================================================
-# 4. LOAD DATASET
-# ============================================================
-
-full_dataset = FlickrImageDataset(
-    image_root=IMAGE_ROOT,
-    transform=None
+train_dataset = CachedPixArtDataset(
+    train_df,
+    latent_cache,
+    text_embedding_cache
 )
 
-if len(full_dataset) < 2:
-
-    raise ValueError(
-        "Dataset contains insufficient valid image-caption pairs."
-    )
-
-print("\nSample annotations:")
-
-print(full_dataset.df.head())
-
-
-# ============================================================
-# 5. TRAIN / VALIDATION SPLIT BY UNIQUE IMAGE
-# ============================================================
-# ============================================================
-# 5. TRAIN / VALIDATION SPLIT
-# EXACTLY 20 TRAINING IMAGES AND 5 VALIDATION IMAGES
-# ============================================================
-
-NUM_TRAIN_IMAGES = 20
-NUM_VAL_IMAGES = 5
-
-unique_images = (
-    full_dataset.df["image"]
-    .unique()
-    .tolist()
+validation_dataset = CachedPixArtDataset(
+    validation_df,
+    latent_cache,
+    text_embedding_cache
 )
 
-if len(unique_images) < NUM_TRAIN_IMAGES + NUM_VAL_IMAGES:
-
-    raise ValueError(
-        "Dataset must contain at least 25 unique images."
-    )
-
-random.seed(SEED)
-
-random.shuffle(unique_images)
-
-# Select 20 training images.
-
-train_images = set(
-    unique_images[:NUM_TRAIN_IMAGES]
-)
-
-# Select 5 validation images.
-
-val_images = set(
-    unique_images[
-        NUM_TRAIN_IMAGES:
-        NUM_TRAIN_IMAGES + NUM_VAL_IMAGES
-    ]
-)
-
-# Filter all captions belonging to selected images.
-
-train_df = full_dataset.df[
-    full_dataset.df["image"].isin(train_images)
-].reset_index(drop=True)
-
-val_df = full_dataset.df[
-    full_dataset.df["image"].isin(val_images)
-].reset_index(drop=True)
-
-
-# ============================================================
-# CREATE DATASETS
-# ============================================================
-
-train_dataset = FlickrImageDataset(
-    image_root=IMAGE_ROOT,
-    transform=train_transform,
-    dataframe=train_df
-)
-
-validation_dataset = FlickrImageDataset(
-    image_root=IMAGE_ROOT,
-    transform=validation_transform,
-    dataframe=val_df
-)
-
-
-# ============================================================
-# VERIFY SPLIT
-# ============================================================
-
-print("\nDataset split completed")
-
-print("Training unique images:",
-      train_dataset.df["image"].nunique())
-
-print("Validation unique images:",
-      validation_dataset.df["image"].nunique())
-
-
-print("Training caption pairs:",
-      len(train_dataset))
-
-print("Validation caption pairs:",
-      len(validation_dataset))
-
-assert train_dataset.df["image"].nunique() == 20
-
-assert validation_dataset.df["image"].nunique() == 5
-
-assert train_images.isdisjoint(val_images)
-
-print("\nNo image overlap between training and validation.")
-# unique_images = (
-#     full_dataset.df["image"]
-#     .unique()
-#     .tolist()
-# )
-
-# generator = torch.Generator().manual_seed(SEED)
-
-# permutation = torch.randperm(
-#     len(unique_images),
-#     generator=generator
-# ).tolist()
-
-# num_val_images = max(
-#     1,
-#     int(len(unique_images) * VALIDATION_RATIO)
-# )
-
-# val_images = set(
-#     unique_images[i]
-#     for i in permutation[:num_val_images]
-# )
-
-# train_df = full_dataset.df[
-#     ~full_dataset.df["image"].isin(val_images)
-# ].reset_index(drop=True)
-
-# val_df = full_dataset.df[
-#     full_dataset.df["image"].isin(val_images)
-# ].reset_index(drop=True)
-
-
-# train_dataset = FlickrImageDataset(
-#     image_root=IMAGE_ROOT,
-#     transform=train_transform,
-#     dataframe=train_df
-# )
-
-# validation_dataset = FlickrImageDataset(
-#     image_root=IMAGE_ROOT,
-#     transform=validation_transform,
-#     dataframe=val_df
-# )
-
-# print("\nDataset split completed")
-
-# print("Training pairs:", len(train_dataset))
-
-# print("Validation pairs:", len(validation_dataset))
-
-# print(
-#     "Training unique images:",
-#     train_dataset.df["image"].nunique()
-# )
-
-# print(
-#     "Validation unique images:",
-#     validation_dataset.df["image"].nunique()
-# )
-
-
-# ============================================================
-# 6. DATALOADERS
-# ============================================================
 
 train_loader = DataLoader(
     train_dataset,
     batch_size=BATCH_SIZE,
     shuffle=True,
     num_workers=NUM_WORKERS,
-    pin_memory=True,
-    drop_last=True
+    pin_memory=False
 )
 
 validation_loader = DataLoader(
@@ -1410,342 +650,229 @@ validation_loader = DataLoader(
     batch_size=BATCH_SIZE,
     shuffle=False,
     num_workers=NUM_WORKERS,
-    pin_memory=True
+    pin_memory=False
 )
-
-if len(train_loader) == 0:
-
-    raise ValueError(
-        "No training batches available."
-    )
 
 
 # ============================================================
-# 7. LOAD PRETRAINED COMPONENTS
+# 15. STAGE 3: LOAD PIXART TRANSFORMER ON GPU
 # ============================================================
-
-print("\nLoading T5 tokenizer...")
-
-tokenizer = T5Tokenizer.from_pretrained(
-    MODEL_NAME,
-    subfolder="tokenizer"
-)
-
-
-# ------------------------------------------------------------
-# T5 TEXT ENCODER
-# ------------------------------------------------------------
-
-print("\nLoading T5 text encoder...")
-
-text_encoder = T5EncoderModel.from_pretrained(
-    MODEL_NAME,
-    subfolder="text_encoder",
-    torch_dtype=WEIGHT_DTYPE,
-    low_cpu_mem_usage=True
-)
-
-# FREEZE T5 BEFORE MOVING TO GPU.
-
-text_encoder.requires_grad_(False)
-
-text_encoder.eval()
-
-text_encoder.to(DEVICE)
-
-# Verify T5 is completely frozen.
-
-assert not any(
-    p.requires_grad
-    for p in text_encoder.parameters()
-)
-
-print("T5 successfully frozen.")
-
-print(
-    "T5 trainable parameters:",
-    sum(
-        p.numel()
-        for p in text_encoder.parameters()
-        if p.requires_grad
-    )
-)
-
-
-# ------------------------------------------------------------
-# VAE
-# ------------------------------------------------------------
-
-print("\nLoading VAE...")
-
-vae = AutoencoderKL.from_pretrained(
-    MODEL_NAME,
-    subfolder="vae",
-    torch_dtype=WEIGHT_DTYPE,
-    low_cpu_mem_usage=True
-)
-
-# FREEZE VAE.
-
-vae.requires_grad_(False)
-
-vae.eval()
-
-vae.to(DEVICE)
-
-assert not any(
-    p.requires_grad
-    for p in vae.parameters()
-)
-
-print("VAE successfully frozen.")
-
-
-# ------------------------------------------------------------
-# PIXART TRANSFORMER
-# ------------------------------------------------------------
 
 print("\nLoading PixArt transformer...")
+
+clear_memory()
+
+print_gpu_memory(
+    "Before loading PixArt"
+)
 
 transformer = PixArtTransformer2DModel.from_pretrained(
     MODEL_NAME,
     subfolder="transformer",
-    torch_dtype=WEIGHT_DTYPE,
-    low_cpu_mem_usage=True
-).to(DEVICE)
-
-
-# ============================================================
-# 8. TRAINING NOISE SCHEDULER
-# ============================================================
-
-inference_scheduler = DPMSolverMultistepScheduler.from_pretrained(
-    MODEL_NAME,
-    subfolder="scheduler"
+    torch_dtype=(
+        torch.float16 if USE_FP16 else torch.float32
+    )
 )
 
-noise_scheduler = DDPMScheduler.from_config(
-    inference_scheduler.config
+transformer.to(DEVICE)
+
+transformer.train()
+
+print("PixArt loaded on:", DEVICE)
+
+print_gpu_memory(
+    "After loading PixArt"
 )
-
-del inference_scheduler
-
-gc.collect()
-
-torch.cuda.empty_cache()
 
 
 # ============================================================
-# 9. FREEZE PIXART TRANSFORMER
+# 16. FREEZE ALL PIXART PARAMETERS
 # ============================================================
 
 transformer.requires_grad_(False)
 
-blocks = transformer.transformer_blocks
 
-total_blocks = len(blocks)
+# ============================================================
+# 17. UNFREEZE LAST TWO TRANSFORMER BLOCKS
+# ============================================================
 
-print("\nTotal transformer blocks:", total_blocks)
+if not hasattr(transformer, "transformer_blocks"):
 
-if NUM_TRAINABLE_BLOCKS > total_blocks:
-
-    raise ValueError(
-        "NUM_TRAINABLE_BLOCKS exceeds available transformer blocks."
+    raise RuntimeError(
+        "Expected transformer_blocks in PixArt model. "
+        "Check your Diffusers model version."
     )
 
-# Unfreeze only the last N blocks.
+blocks = transformer.transformer_blocks
 
-for block in blocks[-NUM_TRAINABLE_BLOCKS:]:
+if len(blocks) < NUM_TRAINABLE_BLOCKS:
+
+    raise RuntimeError(
+        "Requested more trainable blocks than available."
+    )
+
+trainable_blocks = blocks[
+    -NUM_TRAINABLE_BLOCKS:
+]
+
+for block in trainable_blocks:
 
     block.requires_grad_(True)
 
 
 # Unfreeze output projection.
 
-if hasattr(transformer, "proj_out"):
-
-    transformer.proj_out.requires_grad_(True)
-
-else:
-
-    raise AttributeError(
-        "PixArt transformer does not contain proj_out."
-    )
-
-
-# Convert trainable parameters to FP32.
-
-for param in transformer.parameters():
-
-    if param.requires_grad:
-
-        param.data = param.data.float()
+transformer.proj_out.requires_grad_(True)
 
 
 # ============================================================
-# 10. PARAMETER SUMMARY
+# 18. ENABLE GRADIENT CHECKPOINTING
 # ============================================================
+
+transformer.enable_gradient_checkpointing()
+
+print("\nGradient checkpointing enabled")
+
+
+# ============================================================
+# 19. KEEP TRAINABLE PARAMETERS IN FP32
+# ============================================================
+
+trainable_parameters = []
+
+for parameter in transformer.parameters():
+
+    if parameter.requires_grad:
+
+        parameter.data = (
+            parameter.data.float()
+        )
+
+        trainable_parameters.append(
+            parameter
+        )
+
 
 total_parameters = sum(
-    p.numel()
-    for p in transformer.parameters()
+    parameter.numel()
+    for parameter in transformer.parameters()
 )
 
-trainable_parameters = sum(
-    p.numel()
-    for p in transformer.parameters()
-    if p.requires_grad
+trainable_count = sum(
+    parameter.numel()
+    for parameter in trainable_parameters
 )
 
-print("\nTotal parameters:", f"{total_parameters:,}")
+print("\nPixArt parameter information")
+
+print(
+    "Total parameters:",
+    f"{total_parameters:,}"
+)
 
 print(
     "Trainable parameters:",
-    f"{trainable_parameters:,}"
+    f"{trainable_count:,}"
 )
 
 print(
     "Trainable percentage:",
-    f"{100 * trainable_parameters / total_parameters:.2f}%"
+    f"{100 * trainable_count / total_parameters:.2f}%"
+)
+
+if trainable_count == 0:
+    raise RuntimeError("No trainable parameters found.")
+
+
+# ============================================================
+# 20. LOAD DIFFUSION NOISE SCHEDULER
+# ============================================================
+
+noise_scheduler = DDPMScheduler.from_pretrained(
+    MODEL_NAME,
+    subfolder="scheduler"
 )
 
 print(
-    "Frozen T5 parameters:",
-    f"{sum(p.numel() for p in text_encoder.parameters()):,}"
-)
-
-print(
-    "Frozen VAE parameters:",
-    f"{sum(p.numel() for p in vae.parameters()):,}"
+    "\nPrediction type:",
+    noise_scheduler.config.prediction_type
 )
 
 
 # ============================================================
-# 11. OPTIMIZER
+# 21. OPTIMIZER
 # ============================================================
-
-trainable_params = [
-    p
-    for p in transformer.parameters()
-    if p.requires_grad
-]
 
 optimizer = torch.optim.AdamW(
-    trainable_params,
+    trainable_parameters,
     lr=LEARNING_RATE,
     weight_decay=WEIGHT_DECAY,
-    betas=(0.9, 0.999)
+    betas=(0.9, 0.999),
+    eps=1e-8,
+    foreach=False
 )
 
-scaler = torch.cuda.amp.GradScaler()
-
-# Enable gradient checkpointing.
-
-transformer.enable_gradient_checkpointing()
-
-print("\nGradient checkpointing enabled.")
-
 
 # ============================================================
-# 12. TEXT EMBEDDING
+# 22. PIXART TRAINING LOSS
 # ============================================================
 
-def encode_captions(captions):
+def calculate_loss(
+    batch,
+    training=True
+):
 
-    tokens = tokenizer(
-        captions,
-        padding="max_length",
-        max_length=MAX_LENGTH,
-        truncation=True,
-        return_tensors="pt"
-    )
+    latents, text_embeddings, attention_mask = batch
 
-    input_ids = tokens.input_ids.to(DEVICE)
-
-    attention_mask = tokens.attention_mask.to(DEVICE)
-
-    # No gradient computation for frozen T5.
-
-    with torch.no_grad():
-
-        embeddings = text_encoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        ).last_hidden_state
-
-    return embeddings, attention_mask
-
-
-# ============================================================
-# 13. DIFFUSION TRAINING LOSS
-# ============================================================
-
-def calculate_loss(batch, training=True):
-
-    images = batch["pixel_values"].to(
+    latents = latents.to(
         DEVICE,
-        dtype=WEIGHT_DTYPE,
-        non_blocking=True
-    )
-
-    captions = batch["caption"]
-
-    # Caption dropout.
-
-    if training:
-
-        captions = [
-            "" if random.random() < CAPTION_DROPOUT
-            else caption
-            for caption in captions
-        ]
-
-
-    # --------------------------------------------------------
-    # A. VAE IMAGE ENCODING (FROZEN)
-    # --------------------------------------------------------
-
-    with torch.no_grad():
-
-        with torch.autocast(
-            device_type="cuda",
-            dtype=WEIGHT_DTYPE
-        ):
-
-            latents = vae.encode(
-                images
-            ).latent_dist.sample()
-
-            latents = (
-                latents * vae.config.scaling_factor
-            )
-
-
-    # --------------------------------------------------------
-    # B. T5 TEXT ENCODING (FROZEN)
-    # --------------------------------------------------------
-
-    text_embeddings, attention_mask = encode_captions(
-        captions
+        dtype=torch.float16 if USE_FP16 else torch.float32
     )
 
     text_embeddings = text_embeddings.to(
-        dtype=WEIGHT_DTYPE
+        DEVICE,
+        dtype=torch.float16 if USE_FP16 else torch.float32
     )
 
-
-    # --------------------------------------------------------
-    # C. RANDOM GAUSSIAN NOISE
-    # --------------------------------------------------------
-
-    noise = torch.randn_like(latents)
+    attention_mask = attention_mask.to(
+        DEVICE
+    )
 
     batch_size = latents.shape[0]
 
+    # Caption dropout for classifier-free guidance.
+    # With BATCH_SIZE=1, this drops the current caption.
 
-    # --------------------------------------------------------
-    # D. RANDOM TIMESTEPS
-    # --------------------------------------------------------
+    if training and random.random() < CAPTION_DROPOUT:
+
+        unconditional_embedding, unconditional_mask = (
+            text_embedding_cache[""]
+        )
+
+        text_embeddings = (
+            unconditional_embedding
+            .unsqueeze(0)
+            .expand(batch_size, -1, -1)
+            .to(
+                DEVICE,
+                dtype=(
+                    torch.float16 if USE_FP16 else torch.float32
+                )
+            )
+        )
+
+        attention_mask = (
+            unconditional_mask
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            .to(DEVICE)
+        )
+
+    # Generate random diffusion noise.
+
+    noise = torch.randn_like(latents)
+
+    # Random diffusion timesteps.
 
     timesteps = torch.randint(
         0,
@@ -1754,10 +881,7 @@ def calculate_loss(batch, training=True):
         device=DEVICE
     ).long()
 
-
-    # --------------------------------------------------------
-    # E. ADD NOISE TO LATENTS
-    # --------------------------------------------------------
+    # Add noise to latent images.
 
     noisy_latents = noise_scheduler.add_noise(
         latents,
@@ -1765,10 +889,56 @@ def calculate_loss(batch, training=True):
         timesteps
     )
 
+    # PixArt additional conditioning.
 
-    # --------------------------------------------------------
-    # F. TARGET
-    # --------------------------------------------------------
+    resolution = torch.tensor(
+        [[IMAGE_SIZE, IMAGE_SIZE]],
+        device=DEVICE
+    ).repeat(batch_size, 1)
+
+    aspect_ratio = torch.ones(
+        (batch_size, 1),
+        device=DEVICE
+    )
+
+    added_cond_kwargs = {
+        "resolution": resolution,
+        "aspect_ratio": aspect_ratio
+    }
+
+    with torch.autocast(
+        device_type="cuda",
+        dtype=torch.float16,
+        enabled=USE_FP16
+    ):
+
+        prediction = transformer(
+            hidden_states=noisy_latents,
+            encoder_hidden_states=text_embeddings,
+            encoder_attention_mask=attention_mask,
+            timestep=timesteps,
+            added_cond_kwargs=added_cond_kwargs,
+            return_dict=True
+        ).sample
+
+    # PixArt may return 2 * latent_channels:
+    # the first half is the noise/velocity prediction, and the
+    # second half is the learned-variance prediction.
+    # The current training objective uses only the first half.
+    expected_channels = latents.shape[1]
+
+    if prediction.shape[1] == 2 * expected_channels:
+        prediction, predicted_variance = torch.chunk(
+            prediction,
+            2,
+            dim=1
+        )
+    elif prediction.shape[1] != expected_channels:
+        raise RuntimeError(
+            f"Unexpected PixArt output shape: {tuple(prediction.shape)}. "
+            f"Expected {expected_channels} or "
+            f"{2 * expected_channels} channels."
+        )
 
     prediction_type = (
         noise_scheduler.config.prediction_type
@@ -1792,65 +962,15 @@ def calculate_loss(batch, training=True):
             f"Unsupported prediction type: {prediction_type}"
         )
 
-
-    # --------------------------------------------------------
-    # G. PIXART FORWARD PASS
-    # --------------------------------------------------------
-
-    batch_size = images.shape[0]
-
-    # PixArt additional micro-conditioning.
-
-    resolution = torch.tensor(
-        [[IMAGE_SIZE, IMAGE_SIZE]],
-        device=DEVICE,
-        dtype=WEIGHT_DTYPE
-    ).repeat(batch_size, 1)
-
-    aspect_ratio = torch.ones(
-        (batch_size, 1),
-        device=DEVICE,
-        dtype=WEIGHT_DTYPE
-    )
-
-    added_cond_kwargs = {
-        "resolution": resolution,
-        "aspect_ratio": aspect_ratio
-    }
-
-    with torch.autocast(
-        device_type="cuda",
-        dtype=WEIGHT_DTYPE
-    ):
-
-        model_output = transformer(
-            hidden_states=noisy_latents,
-            timestep=timesteps,
-            encoder_hidden_states=text_embeddings,
-            encoder_attention_mask=attention_mask,
-            added_cond_kwargs=added_cond_kwargs
-        ).sample
-
-        # PixArt can predict noise and variance together.
-
-        if model_output.shape[1] == 2 * target.shape[1]:
-
-            predicted_noise = model_output.chunk(
-                2,
-                dim=1
-            )[0]
-
-        else:
-
-            predicted_noise = model_output
-
-
-    # --------------------------------------------------------
-    # H. MSE LOSS
-    # --------------------------------------------------------
+    if prediction.shape != target.shape:
+        raise RuntimeError(
+            "Prediction/target shape mismatch before MSE: "
+            f"prediction={tuple(prediction.shape)}, "
+            f"target={tuple(target.shape)}"
+        )
 
     loss = F.mse_loss(
-        predicted_noise.float(),
+        prediction.float(),
         target.float(),
         reduction="mean"
     )
@@ -1859,60 +979,32 @@ def calculate_loss(batch, training=True):
 
 
 # ============================================================
-# 14. VALIDATION
+# 23. TRAINING LOOP
 # ============================================================
 
-@torch.no_grad()
+training_history = []
 
-def validate():
+print_gpu_memory(
+    "GPU memory before training"
+)
 
-    transformer.eval()
+print("\nStarting PixArt fine-tuning...")
 
-    total_loss = 0.0
 
-    count = 0
-
-    for batch in tqdm(
-        validation_loader,
-        desc="Validation"
-    ):
-
-        loss = calculate_loss(
-            batch,
-            training=False
-        )
-
-        total_loss += loss.item()
-
-        count += 1
+for epoch in range(EPOCHS):
 
     transformer.train()
 
-    return total_loss / max(count, 1)
+    train_loss_total = 0.0
 
-
-# ============================================================
-# 15. TRAINING
-# ============================================================
-
-history = {
-    "train_loss": [],
-    "validation_loss": []
-}
-
-
-for epoch in range(NUM_EPOCHS):
-
-    transformer.train()
-
-    optimizer.zero_grad(set_to_none=True)
-
-    total_loss = 0.0
+    optimizer.zero_grad(
+        set_to_none=True
+    )
 
     progress = tqdm(
         enumerate(train_loader),
         total=len(train_loader),
-        desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}"
+        desc=f"Epoch {epoch + 1}/{EPOCHS}"
     )
 
     for step, batch in progress:
@@ -1922,74 +1014,109 @@ for epoch in range(NUM_EPOCHS):
             training=True
         )
 
-        total_loss += loss.item()
+        scaled_loss = (
+            loss / GRADIENT_ACCUMULATION_STEPS
+        )
 
-        scaled_loss = loss / GRAD_ACCUMULATION
+        scaled_loss.backward()
 
-        scaler.scale(scaled_loss).backward()
+        train_loss_total += loss.item()
 
         should_update = (
-            (step + 1) % GRAD_ACCUMULATION == 0
+            (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0
             or (step + 1) == len(train_loader)
         )
 
         if should_update:
 
-            scaler.unscale_(optimizer)
-
             torch.nn.utils.clip_grad_norm_(
-                trainable_params,
+                trainable_parameters,
                 max_norm=1.0
             )
 
-            scaler.step(optimizer)
+            optimizer.step()
 
-            scaler.update()
-
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(
+                set_to_none=True
+            )
 
         progress.set_postfix(
-            loss=f"{loss.item():.5f}"
+            loss=f"{loss.item():.4f}"
         )
 
-    train_loss = total_loss / max(
-        len(train_loader),
-        1
+    train_loss = (
+        train_loss_total / max(len(train_loader), 1)
     )
 
-    validation_loss = validate()
 
-    history["train_loss"].append(train_loss)
+    # ========================================================
+    # VALIDATION
+    # ========================================================
 
-    history["validation_loss"].append(validation_loss)
+    transformer.eval()
 
-    print(f"\nEpoch: {epoch + 1}")
+    validation_loss_total = 0.0
 
-    print(f"Training Loss: {train_loss:.6f}")
+    with torch.no_grad():
 
-    print(f"Validation Loss: {validation_loss:.6f}")
+        for batch in tqdm(
+            validation_loader,
+            desc="Validation"
+        ):
+
+            loss = calculate_loss(
+                batch,
+                training=False
+            )
+
+            validation_loss_total += loss.item()
+
+    validation_loss = (
+        validation_loss_total /
+        max(len(validation_loader), 1)
+    )
 
 
-    # --------------------------------------------------------
-    # SAVE AFTER EACH EPOCH
-    # --------------------------------------------------------
+    # ========================================================
+    # SAVE TRAINABLE PARAMETERS
+    # ========================================================
 
-    epoch_dir = os.path.join(
+    epoch_checkpoint = {}
+
+    for name, parameter in transformer.named_parameters():
+
+        if parameter.requires_grad:
+
+            epoch_checkpoint[name] = (
+                parameter.detach()
+                .cpu()
+                .clone()
+            )
+
+    checkpoint_path = os.path.join(
         OUTPUT_DIR,
-        f"epoch_{epoch + 1}"
+        f"trainable_epoch_{epoch + 1}.pt"
     )
 
-    os.makedirs(
-        epoch_dir,
-        exist_ok=True
+    torch.save(
+        epoch_checkpoint,
+        checkpoint_path
     )
 
-    transformer.save_pretrained(
-        epoch_dir,
-        safe_serialization=True
-    )
 
-    print("Saved:", epoch_dir)
+    # ========================================================
+    # RECORD HISTORY
+    # ========================================================
+
+    epoch_result = {
+        "epoch": epoch + 1,
+        "train_loss": float(train_loss),
+        "validation_loss": float(validation_loss)
+    }
+
+    training_history.append(
+        epoch_result
+    )
 
     with open(
         os.path.join(
@@ -1997,65 +1124,390 @@ for epoch in range(NUM_EPOCHS):
             "training_history.json"
         ),
         "w"
-    ) as f:
+    ) as file:
 
         json.dump(
-            history,
-            f,
+            training_history,
+            file,
             indent=4
         )
 
-    gc.collect()
 
-    torch.cuda.empty_cache()
+    print(
+        f"\nEpoch {epoch + 1}/{EPOCHS}"
+    )
+
+    print(
+        f"Training Loss: {train_loss:.6f}"
+    )
+
+    print(
+        f"Validation Loss: {validation_loss:.6f}"
+    )
+
+    print(
+        "Saved:",
+        checkpoint_path
+    )
+
+    clear_memory()
+
+    print_gpu_memory(
+        f"After epoch {epoch + 1}"
+    )
 
 
 # ============================================================
-# 16. SAVE FINAL TRANSFORMER
+# 24. SAVE COMPLETE FINE-TUNED TRANSFORMER
 # ============================================================
+
+print("\nSaving complete PixArt transformer...")
 
 transformer.save_pretrained(
-    OUTPUT_DIR,
+    TRANSFORMER_OUTPUT_DIR,
     safe_serialization=True
 )
+
+
+# ============================================================
+# 25. SAVE TRAINING CONFIGURATION
+# ============================================================
+
+training_config = {
+
+    "model_name": MODEL_NAME,
+
+    "image_size": IMAGE_SIZE,
+
+    "max_text_length": MAX_TEXT_LENGTH,
+
+    "max_images": MAX_IMAGES,
+
+    "training_images": TRAIN_IMAGES,
+
+    "validation_images": VALIDATION_IMAGES,
+
+    "batch_size": BATCH_SIZE,
+
+    "epochs": EPOCHS,
+
+    "learning_rate": LEARNING_RATE,
+
+    "weight_decay": WEIGHT_DECAY,
+
+    "gradient_accumulation_steps":
+        GRADIENT_ACCUMULATION_STEPS,
+
+    "caption_dropout": CAPTION_DROPOUT,
+
+    "trainable_blocks": NUM_TRAINABLE_BLOCKS,
+
+    "mixed_precision": "fp16" if USE_FP16 else "fp32",
+
+    "trainable_parameters": int(trainable_count),
+
+    "total_parameters": int(total_parameters)
+
+}
 
 with open(
     os.path.join(
         OUTPUT_DIR,
-        "training_history.json"
+        "training_config.json"
     ),
     "w"
-) as f:
+) as file:
 
     json.dump(
-        history,
-        f,
+        training_config,
+        file,
         indent=4
     )
 
 
-print("\nFine-tuning completed!")
+# ============================================================
+# 26. FINISHED
+# ============================================================
 
-print("Saved model:", OUTPUT_DIR)
+print("\n" + "=" * 60)
 
-print("Training history:", history)
+print("PIXART FINE-TUNING COMPLETED")
 
-print("\nFinal trainable parameter count:")
+print("=" * 60)
 
-print(
-    sum(
-        p.numel()
-        for p in transformer.parameters()
-        if p.requires_grad
-    )
+print("Output directory:", OUTPUT_DIR)
+
+print("Transformer directory:", TRANSFORMER_OUTPUT_DIR)
+
+print("Training history:", training_history)
+
+print_gpu_memory(
+    "Final GPU memory"
 )
 
-print("\nT5 remains frozen:", not any(
-    p.requires_grad
-    for p in text_encoder.parameters()
-))
 
-print("VAE remains frozen:", not any(
-    p.requires_grad
-    for p in vae.parameters()
-))
+
+#-------------------------inference------------------------------
+
+
+# =========================================================
+# MEMORY-OPTIMIZED PIXART-ALPHA INFERENCE
+# CPU MODEL OFFLOADING
+# =========================================================
+
+import os
+import gc
+import torch
+
+from IPython.display import display
+
+from diffusers import (
+    PixArtAlphaPipeline,
+    PixArtTransformer2DModel,
+    DPMSolverMultistepScheduler
+)
+
+# =========================================================
+# 1. CONFIGURATION
+# =========================================================
+
+MODEL_NAME = "PixArt-alpha/PixArt-XL-2-512x512"
+
+OUTPUT_DIR = "/kaggle/working/pixart_finetuned"
+
+TRANSFORMER_DIR = os.path.join(
+    OUTPUT_DIR,
+    "transformer"
+)
+
+EPOCH_TO_LOAD = 5
+
+OUTPUT_IMAGE = os.path.join(
+    OUTPUT_DIR,
+    "demo_prediction.png"
+)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+DTYPE = (
+    torch.float16
+    if DEVICE == "cuda"
+    else torch.float32
+)
+
+# =========================================================
+# 2. RELEASE UNUSED MEMORY
+# =========================================================
+
+gc.collect()
+
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+
+if not os.path.isdir(TRANSFORMER_DIR):
+    raise FileNotFoundError(TRANSFORMER_DIR)
+
+# =========================================================
+# 3. LOAD SAVED TRANSFORMER ON CPU
+# =========================================================
+
+print("Loading saved Transformer...")
+
+transformer = PixArtTransformer2DModel.from_pretrained(
+    TRANSFORMER_DIR,
+    torch_dtype=DTYPE,
+    low_cpu_mem_usage=True
+)
+
+transformer.eval()
+
+print("Transformer loaded.")
+
+# =========================================================
+# 4. LOAD EPOCH CHECKPOINT
+# =========================================================
+
+checkpoint_candidates = [
+    os.path.join(
+        OUTPUT_DIR,
+        f"trainable_epoch_{EPOCH_TO_LOAD}.pt"
+    ),
+    os.path.join(
+        OUTPUT_DIR,
+        f"trainable_epoch{EPOCH_TO_LOAD}.pt"
+    )
+]
+
+checkpoint_path = next(
+    (
+        p for p in checkpoint_candidates
+        if os.path.isfile(p)
+    ),
+    None
+)
+
+if checkpoint_path:
+
+    print("Loading checkpoint:", checkpoint_path)
+
+    try:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True
+        )
+    except TypeError:
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location="cpu"
+        )
+
+    if "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
+
+    current_state = transformer.state_dict()
+
+    compatible = {
+        name: value
+        for name, value in checkpoint.items()
+        if (
+            name in current_state
+            and current_state[name].shape == value.shape
+        )
+    }
+
+    if not compatible:
+        raise RuntimeError(
+            "No compatible epoch weights found."
+        )
+
+    current_state.update(compatible)
+
+    transformer.load_state_dict(current_state)
+
+    print(
+        "Loaded trainable tensors:",
+        len(compatible)
+    )
+
+    del checkpoint
+    del current_state
+    del compatible
+
+else:
+    print(
+        "Epoch checkpoint not found. "
+        "Using the complete saved Transformer."
+    )
+
+gc.collect()
+
+# =========================================================
+# 5. LOAD PIPELINE ON CPU
+# =========================================================
+
+print("\nLoading PixArt pipeline...")
+
+pipe = PixArtAlphaPipeline.from_pretrained(
+    MODEL_NAME,
+    transformer=transformer,
+    torch_dtype=DTYPE,
+    low_cpu_mem_usage=True
+)
+
+del transformer
+gc.collect()
+
+# =========================================================
+# 6. INFERENCE SCHEDULER
+# =========================================================
+
+pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+    pipe.scheduler.config
+)
+
+# =========================================================
+# 7. ENABLE CPU OFFLOADING
+# =========================================================
+
+if DEVICE == "cuda":
+
+    # Moves components to GPU only when needed.
+    # Do NOT call pipe.to("cuda") after this.
+
+    pipe.enable_model_cpu_offload()
+
+    print("CPU model offloading enabled.")
+
+else:
+
+    pipe.to("cpu")
+
+# =========================================================
+# 8. TEXT PROMPT
+# =========================================================
+
+prompt = (
+    "A majestic snow leopard sitting on a rocky mountain cliff "
+    "overlooking a vast Himalayan mountain range, snow-covered peaks, "
+    "soft morning sunlight, ultra-realistic wildlife photography, "
+    "highly detailed fur, sharp focus, natural colors, "
+    "cinematic composition, 8K photography"
+)
+
+negative_prompt = (
+    "blurry, low quality, distorted, deformed, "
+    "bad anatomy, unrealistic proportions"
+)
+
+# =========================================================
+# 9. GENERATE IMAGE
+# =========================================================
+
+generator = torch.Generator(
+    device="cpu"
+).manual_seed(42)
+
+print("\nGenerating image...")
+
+with torch.inference_mode():
+
+    result = pipe(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+
+        height=512,
+        width=512,
+
+        num_inference_steps=20,
+
+        guidance_scale=4.5,
+
+        num_images_per_prompt=1,
+
+        generator=generator
+    )
+
+generated_image = result.images[0]
+
+# =========================================================
+# 10. SAVE AND DISPLAY
+# =========================================================
+
+generated_image.save(OUTPUT_IMAGE)
+
+display(generated_image)
+
+print("\nImage generated successfully.")
+print("Saved:", OUTPUT_IMAGE)
+if torch.cuda.is_available():
+
+    print(
+        "GPU allocated:",
+        round(
+            torch.cuda.memory_allocated() / 1024**3,
+            2
+        ),
+        "GB"
+    )
