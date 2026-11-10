@@ -1,0 +1,1777 @@
+
+# ============================================================
+# STABLE DIFFUSION 1.5 FINE-TUNING ON FLICKR30K
+# Optimized for a 14.56 GB CUDA GPU
+#
+# Stage 1: CLIP GPU -> cache text embeddings -> release CLIP
+# Stage 2: VAE GPU -> cache image latents -> release VAE
+# Stage 3: UNet GPU -> fine-tune selected UNet blocks
+#
+# Dataset:
+# 30 unique images
+# 20 training images
+# 5 validation images
+# 5 unused images
+#
+# Trainable:
+# Last 2 UNet up blocks
+# Output normalization + projection
+# ============================================================
+
+
+# ============================================================
+# 1. IMPORTS
+# ============================================================
+
+import os
+import gc
+import json
+import random
+import numpy as np
+import pandas as pd
+
+from contextlib import nullcontext
+from PIL import Image
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn.functional as F
+
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+
+from transformers import (
+    CLIPTokenizer,
+    CLIPTextModel
+)
+
+from diffusers import (
+    UNet2DConditionModel,
+    AutoencoderKL,
+    DDPMScheduler
+)
+
+
+# ============================================================
+# 2. CONFIGURATION
+# ============================================================
+
+MODEL_NAME = (
+    "stable-diffusion-v1-5/"
+    "stable-diffusion-v1-5"
+)
+
+DATASET_ROOT = (
+    "/kaggle/input/datasets/hsankesara/"
+    "flickr-image-dataset/flickr30k_images"
+)
+
+IMAGE_ROOT = os.path.join(
+    DATASET_ROOT,
+    "flickr30k_images"
+)
+
+CAPTION_FILE = os.path.join(
+    DATASET_ROOT,
+    "results.csv"
+)
+
+OUTPUT_DIR = (
+    "/kaggle/working/"
+    "stable_diffusion15_finetuned"
+)
+
+UNET_OUTPUT_DIR = os.path.join(
+    OUTPUT_DIR,
+    "unet"
+)
+
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+IMAGE_SIZE = 512
+
+# CLIP tokenizer maximum length for SD 1.5.
+MAX_TEXT_LENGTH = 77
+
+MAX_IMAGES = 30
+
+TRAIN_IMAGES = 20
+
+VALIDATION_IMAGES = 5
+
+BATCH_SIZE = 1
+
+EPOCHS = 5
+
+LEARNING_RATE = 1e-5
+
+WEIGHT_DECAY = 0.01
+
+GRADIENT_ACCUMULATION_STEPS = 4
+
+CAPTION_DROPOUT = 0.10
+
+NUM_TRAINABLE_BLOCKS = 2
+
+NUM_WORKERS = 0
+
+SEED = 42
+
+USE_FP16 = DEVICE.type == "cuda"
+
+WEIGHT_DTYPE = (
+    torch.float16
+    if USE_FP16
+    else torch.float32
+)
+
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    UNET_OUTPUT_DIR,
+    exist_ok=True
+)
+
+random.seed(SEED)
+
+np.random.seed(SEED)
+
+torch.manual_seed(SEED)
+
+if torch.cuda.is_available():
+
+    torch.cuda.manual_seed_all(SEED)
+
+torch.backends.cuda.matmul.allow_tf32 = True
+
+torch.backends.cudnn.allow_tf32 = True
+
+print("Device:", DEVICE)
+
+print("Model:", MODEL_NAME)
+
+print("Dataset root:", DATASET_ROOT)
+
+print("Image directory:", IMAGE_ROOT)
+
+print("Caption file:", CAPTION_FILE)
+
+
+# ============================================================
+# 3. GPU MEMORY UTILITIES
+# ============================================================
+
+def clear_memory():
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+
+        torch.cuda.empty_cache()
+
+        torch.cuda.ipc_collect()
+
+
+def print_gpu_memory(title):
+
+    if not torch.cuda.is_available():
+
+        return
+
+    torch.cuda.synchronize()
+
+    allocated = (
+        torch.cuda.memory_allocated() / 1024**3
+    )
+
+    reserved = (
+        torch.cuda.memory_reserved() / 1024**3
+    )
+
+    free, total = torch.cuda.mem_get_info()
+
+    free = free / 1024**3
+
+    total = total / 1024**3
+
+    print(f"\n{title}")
+
+    print(f"GPU total:     {total:.2f} GB")
+
+    print(f"GPU free:      {free:.2f} GB")
+
+    print(f"GPU allocated: {allocated:.2f} GB")
+
+    print(f"GPU reserved:  {reserved:.2f} GB\n")
+
+
+def autocast_context():
+
+    if USE_FP16:
+
+        return torch.autocast(
+            device_type="cuda",
+            dtype=torch.float16
+        )
+
+    return nullcontext()
+
+
+# ============================================================
+# 4. LOAD AND FILTER FLICKR30K DATASET
+# ============================================================
+
+class FlickrImageDataset:
+
+    def __init__(
+        self,
+        image_root,
+        caption_file,
+        max_images=30
+    ):
+
+        self.image_root = image_root
+
+        if not os.path.exists(caption_file):
+
+            raise FileNotFoundError(
+                f"Caption file not found: {caption_file}"
+            )
+
+        if not os.path.isdir(image_root):
+
+            raise FileNotFoundError(
+                f"Image directory not found: {image_root}"
+            )
+
+        df = pd.read_csv(
+            caption_file,
+            sep="|",
+            skipinitialspace=True
+        )
+
+        df.columns = [
+            str(column).strip()
+            for column in df.columns
+        ]
+
+        required_columns = {
+            "image_name",
+            "comment"
+        }
+
+        if not required_columns.issubset(df.columns):
+
+            raise ValueError(
+                f"Expected columns: {required_columns}. "
+                f"Found: {list(df.columns)}"
+            )
+
+        df = df[
+            ["image_name", "comment"]
+        ].copy()
+
+        df["image_name"] = (
+            df["image_name"]
+            .astype(str)
+            .str.strip()
+        )
+
+        df["comment"] = (
+            df["comment"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        df = df[
+            (df["image_name"] != "") &
+            (df["comment"] != "")
+        ]
+
+        unique_names = (
+            df["image_name"]
+            .drop_duplicates()
+            .tolist()
+        )
+
+        selected_names = unique_names[:max_images]
+
+        valid_names = []
+
+        for image_name in selected_names:
+
+            image_path = os.path.join(
+                image_root,
+                image_name
+            )
+
+            if os.path.isfile(image_path):
+
+                valid_names.append(image_name)
+
+        if not valid_names:
+
+            raise RuntimeError(
+                "No valid images found. Check IMAGE_ROOT."
+            )
+
+        self.df = df[
+            df["image_name"].isin(valid_names)
+        ].reset_index(drop=True)
+
+        self.image_names = valid_names
+
+        print("\nDataset loaded successfully")
+
+        print(
+            "Unique images:",
+            len(self.image_names)
+        )
+
+        print(
+            "Caption rows:",
+            len(self.df)
+        )
+
+
+full_dataset = FlickrImageDataset(
+    image_root=IMAGE_ROOT,
+    caption_file=CAPTION_FILE,
+    max_images=MAX_IMAGES
+)
+
+
+# ============================================================
+# 5. TRAIN / VALIDATION SPLIT
+# ============================================================
+
+unique_images = full_dataset.image_names.copy()
+
+random.shuffle(unique_images)
+
+train_images = unique_images[:TRAIN_IMAGES]
+
+validation_images = unique_images[
+    TRAIN_IMAGES:
+    TRAIN_IMAGES + VALIDATION_IMAGES
+]
+
+unused_images = unique_images[
+    TRAIN_IMAGES + VALIDATION_IMAGES:
+]
+
+train_df = full_dataset.df[
+    full_dataset.df["image_name"].isin(train_images)
+].reset_index(drop=True)
+
+validation_df = full_dataset.df[
+    full_dataset.df["image_name"].isin(validation_images)
+].reset_index(drop=True)
+
+print("\nDataset split")
+
+print(
+    "Training images:",
+    len(train_images)
+)
+
+print(
+    "Validation images:",
+    len(validation_images)
+)
+
+print(
+    "Unused images:",
+    len(unused_images)
+)
+
+print(
+    "Training captions:",
+    len(train_df)
+)
+
+print(
+    "Validation captions:",
+    len(validation_df)
+)
+
+if not len(train_df) or not len(validation_df):
+
+    raise RuntimeError(
+        "Training or validation dataset is empty."
+    )
+
+
+# ============================================================
+# 6. IMAGE TRANSFORM
+# ============================================================
+
+image_transform = transforms.Compose([
+
+    transforms.Resize(
+        IMAGE_SIZE,
+        interpolation=(
+            transforms.InterpolationMode.BILINEAR
+        )
+    ),
+
+    transforms.CenterCrop(
+        IMAGE_SIZE
+    ),
+
+    transforms.ToTensor(),
+
+    transforms.Normalize(
+        [0.5, 0.5, 0.5],
+        [0.5, 0.5, 0.5]
+    )
+
+])
+
+
+def load_image(image_name):
+
+    image_path = os.path.join(
+        IMAGE_ROOT,
+        image_name
+    )
+
+    with Image.open(image_path) as image:
+
+        image = image.convert("RGB")
+
+        return image_transform(image)
+
+
+# ============================================================
+# 7. COLLECT UNIQUE CAPTIONS
+# ============================================================
+
+all_captions = (
+    pd.concat([
+        train_df["comment"],
+        validation_df["comment"]
+    ])
+    .drop_duplicates()
+    .tolist()
+)
+
+# Include empty prompt for classifier-free caption dropout.
+
+all_captions.append("")
+
+all_captions = list(
+    dict.fromkeys(all_captions)
+)
+
+print(
+    "\nUnique captions:",
+    len(all_captions)
+)
+
+
+# ============================================================
+# 8. STAGE 1: LOAD CLIP TEXT ENCODER
+# ============================================================
+
+print("\nLoading CLIP tokenizer and text encoder...")
+
+clear_memory()
+
+print_gpu_memory(
+    "Before loading CLIP"
+)
+
+tokenizer = CLIPTokenizer.from_pretrained(
+    MODEL_NAME,
+    subfolder="tokenizer"
+)
+
+text_encoder = CLIPTextModel.from_pretrained(
+    MODEL_NAME,
+    subfolder="text_encoder",
+    torch_dtype=WEIGHT_DTYPE,
+    use_safetensors=True
+)
+
+text_encoder.to(DEVICE)
+
+text_encoder.eval()
+
+text_encoder.requires_grad_(False)
+
+print(
+    "CLIP loaded on:",
+    DEVICE
+)
+
+print_gpu_memory(
+    "After loading CLIP"
+)
+
+
+# ============================================================
+# 9. PRECOMPUTE TEXT EMBEDDINGS
+# ============================================================
+
+text_embedding_cache = {}
+
+print("\nGenerating CLIP caption embeddings...")
+
+# no_grad is used instead of inference_mode so cached
+# tensors can safely be used in later autograd operations.
+
+with torch.no_grad():
+
+    for caption in tqdm(all_captions):
+
+        tokens = tokenizer(
+            caption,
+            max_length=MAX_TEXT_LENGTH,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        input_ids = tokens.input_ids.to(
+            DEVICE
+        )
+
+        with autocast_context():
+
+            outputs = text_encoder(
+                input_ids=input_ids
+            )
+
+        embedding = (
+            outputs.last_hidden_state[0]
+            .detach()
+            .cpu()
+            .to(torch.float16)
+            .clone()
+        )
+
+        text_embedding_cache[caption] = embedding
+
+        del outputs
+        del input_ids
+
+print(
+    "Text embeddings cached:",
+    len(text_embedding_cache)
+)
+
+
+# ============================================================
+# 10. RELEASE CLIP GPU MEMORY
+# ============================================================
+
+del text_encoder
+
+del tokenizer
+
+clear_memory()
+
+print_gpu_memory(
+    "After releasing CLIP"
+)
+
+
+# ============================================================
+# 11. STAGE 2: LOAD VAE
+# ============================================================
+
+print("\nLoading Stable Diffusion VAE...")
+
+vae = AutoencoderKL.from_pretrained(
+    MODEL_NAME,
+    subfolder="vae",
+    torch_dtype=WEIGHT_DTYPE,
+    use_safetensors=True
+)
+
+vae.to(DEVICE)
+
+vae.eval()
+
+vae.requires_grad_(False)
+
+print(
+    "VAE loaded on:",
+    DEVICE
+)
+
+print_gpu_memory(
+    "After loading VAE"
+)
+
+
+# ============================================================
+# 12. PRECOMPUTE IMAGE LATENTS
+# ============================================================
+
+latent_cache = {}
+
+all_selected_images = (
+    train_images + validation_images
+)
+
+print("\nGenerating image latents...")
+
+with torch.no_grad():
+
+    for image_name in tqdm(all_selected_images):
+
+        image_tensor = load_image(
+            image_name
+        ).unsqueeze(0).to(
+            DEVICE,
+            dtype=WEIGHT_DTYPE
+        )
+
+        with autocast_context():
+
+            encoded = vae.encode(
+                image_tensor
+            )
+
+            latent = (
+                encoded.latent_dist.sample()
+            )
+
+            # Standard Stable Diffusion latent scaling.
+
+            latent = (
+                latent * vae.config.scaling_factor
+            )
+
+        latent_cache[image_name] = (
+            latent[0]
+            .detach()
+            .cpu()
+            .to(torch.float16)
+            .clone()
+        )
+
+        del image_tensor
+        del encoded
+        del latent
+
+print(
+    "Cached image latents:",
+    len(latent_cache)
+)
+
+
+# ============================================================
+# 13. RELEASE VAE GPU MEMORY
+# ============================================================
+
+del vae
+
+clear_memory()
+
+print_gpu_memory(
+    "After releasing VAE"
+)
+
+
+# ============================================================
+# 14. CACHED TRAINING DATASET
+# ============================================================
+
+class CachedStableDiffusionDataset(Dataset):
+
+    def __init__(
+        self,
+        dataframe,
+        latent_cache,
+        text_cache
+    ):
+
+        self.df = dataframe.reset_index(
+            drop=True
+        )
+
+        self.latent_cache = latent_cache
+
+        self.text_cache = text_cache
+
+    def __len__(self):
+
+        return len(self.df)
+
+    def __getitem__(self, index):
+
+        row = self.df.iloc[index]
+
+        image_name = row["image_name"]
+
+        caption = row["comment"]
+
+        latent = self.latent_cache[
+            image_name
+        ]
+
+        text_embedding = self.text_cache[
+            caption
+        ]
+
+        return (
+            latent,
+            text_embedding
+        )
+
+
+train_dataset = CachedStableDiffusionDataset(
+    train_df,
+    latent_cache,
+    text_embedding_cache
+)
+
+validation_dataset = CachedStableDiffusionDataset(
+    validation_df,
+    latent_cache,
+    text_embedding_cache
+)
+
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=NUM_WORKERS,
+    pin_memory=False
+)
+
+validation_loader = DataLoader(
+    validation_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=False
+)
+
+
+# ============================================================
+# 15. STAGE 3: LOAD STABLE DIFFUSION UNET
+# ============================================================
+
+print("\nLoading Stable Diffusion UNet...")
+
+clear_memory()
+
+print_gpu_memory(
+    "Before loading UNet"
+)
+
+unet = UNet2DConditionModel.from_pretrained(
+    MODEL_NAME,
+    subfolder="unet",
+    torch_dtype=WEIGHT_DTYPE,
+    use_safetensors=True,
+    low_cpu_mem_usage=True
+)
+
+unet.to(DEVICE)
+
+print(
+    "UNet loaded on:",
+    DEVICE
+)
+
+print_gpu_memory(
+    "After loading UNet"
+)
+
+
+# ============================================================
+# 16. FREEZE ALL UNET PARAMETERS
+# ============================================================
+
+unet.requires_grad_(False)
+
+
+# ============================================================
+# 17. UNFREEZE LAST TWO UNET UP BLOCKS
+# ============================================================
+
+if not hasattr(unet, "up_blocks"):
+
+    raise RuntimeError(
+        "Expected up_blocks in Stable Diffusion UNet."
+    )
+
+blocks = unet.up_blocks
+
+if len(blocks) < NUM_TRAINABLE_BLOCKS:
+
+    raise RuntimeError(
+        "Requested more trainable blocks than available."
+    )
+
+trainable_blocks = blocks[
+    -NUM_TRAINABLE_BLOCKS:
+]
+
+for block in trainable_blocks:
+
+    block.requires_grad_(True)
+
+
+# Unfreeze final output normalization.
+
+if hasattr(unet, "conv_norm_out"):
+
+    unet.conv_norm_out.requires_grad_(True)
+
+
+# Unfreeze final output projection.
+
+unet.conv_out.requires_grad_(True)
+
+
+# ============================================================
+# 18. ENABLE GRADIENT CHECKPOINTING
+# ============================================================
+
+unet.enable_gradient_checkpointing()
+
+print(
+    "\nUNet gradient checkpointing enabled."
+)
+
+
+# ============================================================
+# 19. KEEP TRAINABLE PARAMETERS IN FP32
+# ============================================================
+
+trainable_parameters = []
+
+for parameter in unet.parameters():
+
+    if parameter.requires_grad:
+
+        parameter.data = (
+            parameter.data.float()
+        )
+
+        trainable_parameters.append(
+            parameter
+        )
+
+
+total_parameters = sum(
+    parameter.numel()
+    for parameter in unet.parameters()
+)
+
+trainable_count = sum(
+    parameter.numel()
+    for parameter in trainable_parameters
+)
+
+print("\nUNet parameter information")
+
+print(
+    "Total parameters:",
+    f"{total_parameters:,}"
+)
+
+print(
+    "Trainable parameters:",
+    f"{trainable_count:,}"
+)
+
+print(
+    "Trainable percentage:",
+    f"{100 * trainable_count / total_parameters:.2f}%"
+)
+
+if trainable_count == 0:
+
+    raise RuntimeError(
+        "No trainable parameters found."
+    )
+
+
+# ============================================================
+# 20. LOAD DIFFUSION NOISE SCHEDULER
+# ============================================================
+
+noise_scheduler = DDPMScheduler.from_pretrained(
+    MODEL_NAME,
+    subfolder="scheduler"
+)
+
+print(
+    "\nPrediction type:",
+    noise_scheduler.config.prediction_type
+)
+
+
+# ============================================================
+# 21. OPTIMIZER AND GRADIENT SCALER
+# ============================================================
+
+optimizer = torch.optim.AdamW(
+    trainable_parameters,
+    lr=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+    betas=(0.9, 0.999),
+    eps=1e-8,
+    foreach=False
+)
+
+# FP32 trainable parameters + FP16 autocast.
+# GradScaler helps prevent FP16 gradient underflow.
+
+scaler = torch.amp.GradScaler(
+    "cuda",
+    enabled=USE_FP16
+)
+
+
+# ============================================================
+# 22. UNET TRAINING MODE
+# ============================================================
+
+def set_unet_training_mode():
+
+    unet.train()
+
+    # Keep frozen blocks in evaluation mode.
+
+    for block in unet.down_blocks:
+
+        block.eval()
+
+    if unet.mid_block is not None:
+
+        unet.mid_block.eval()
+
+    # Keep earlier up blocks in evaluation mode.
+
+    for block in unet.up_blocks[
+        :-NUM_TRAINABLE_BLOCKS
+    ]:
+
+        block.eval()
+
+
+# ============================================================
+# 23. STABLE DIFFUSION TRAINING LOSS
+# ============================================================
+
+def calculate_loss(
+    batch,
+    training=True
+):
+
+    latents, text_embeddings = batch
+
+    latents = latents.to(
+        DEVICE,
+        dtype=WEIGHT_DTYPE
+    )
+
+    text_embeddings = text_embeddings.to(
+        DEVICE,
+        dtype=WEIGHT_DTYPE
+    )
+
+    batch_size = latents.shape[0]
+
+    # --------------------------------------------------------
+    # CLASSIFIER-FREE CAPTION DROPOUT
+    # --------------------------------------------------------
+
+    if (
+        training
+        and random.random() < CAPTION_DROPOUT
+    ):
+
+        unconditional_embedding = (
+            text_embedding_cache[""]
+        )
+
+        text_embeddings = (
+            unconditional_embedding
+            .unsqueeze(0)
+            .expand(batch_size, -1, -1)
+            .to(
+                DEVICE,
+                dtype=WEIGHT_DTYPE
+            )
+        )
+
+    # --------------------------------------------------------
+    # GENERATE RANDOM DIFFUSION NOISE
+    # --------------------------------------------------------
+
+    noise = torch.randn_like(
+        latents
+    )
+
+    # --------------------------------------------------------
+    # RANDOM DIFFUSION TIMESTEPS
+    # --------------------------------------------------------
+
+    timesteps = torch.randint(
+        0,
+        noise_scheduler.config.num_train_timesteps,
+        (batch_size,),
+        device=DEVICE
+    ).long()
+
+    # --------------------------------------------------------
+    # ADD NOISE TO LATENTS
+    # --------------------------------------------------------
+
+    noisy_latents = noise_scheduler.add_noise(
+        latents,
+        noise,
+        timesteps
+    )
+
+    # --------------------------------------------------------
+    # UNET NOISE PREDICTION
+    # --------------------------------------------------------
+
+    with autocast_context():
+
+        prediction = unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=text_embeddings,
+            return_dict=True
+        ).sample
+
+    # --------------------------------------------------------
+    # TARGET BASED ON PREDICTION TYPE
+    # --------------------------------------------------------
+
+    prediction_type = (
+        noise_scheduler.config.prediction_type
+    )
+
+    if prediction_type == "epsilon":
+
+        target = noise
+
+    elif prediction_type == "v_prediction":
+
+        target = noise_scheduler.get_velocity(
+            latents,
+            noise,
+            timesteps
+        )
+
+    else:
+
+        raise ValueError(
+            f"Unsupported prediction type: {prediction_type}"
+        )
+
+    if prediction.shape != target.shape:
+
+        raise RuntimeError(
+            "Prediction/target shape mismatch: "
+            f"{tuple(prediction.shape)} vs "
+            f"{tuple(target.shape)}"
+        )
+
+    # --------------------------------------------------------
+    # DIFFUSION MSE LOSS
+    # --------------------------------------------------------
+
+    loss = F.mse_loss(
+        prediction.float(),
+        target.float(),
+        reduction="mean"
+    )
+
+    return loss
+
+
+# ============================================================
+# 24. TRAINING LOOP
+# ============================================================
+
+training_history = []
+
+print_gpu_memory(
+    "GPU memory before training"
+)
+
+print(
+    "\nStarting Stable Diffusion fine-tuning..."
+)
+
+
+for epoch in range(EPOCHS):
+
+    set_unet_training_mode()
+
+    train_loss_total = 0.0
+
+    optimizer.zero_grad(
+        set_to_none=True
+    )
+
+    progress = tqdm(
+        enumerate(train_loader),
+        total=len(train_loader),
+        desc=f"Epoch {epoch + 1}/{EPOCHS}"
+    )
+
+    for step, batch in progress:
+
+        loss = calculate_loss(
+            batch,
+            training=True
+        )
+
+        # Correct scaling even for the final
+        # incomplete accumulation group.
+
+        group_start = (
+            step // GRADIENT_ACCUMULATION_STEPS
+        ) * GRADIENT_ACCUMULATION_STEPS
+
+        group_size = min(
+            GRADIENT_ACCUMULATION_STEPS,
+            len(train_loader) - group_start
+        )
+
+        scaled_loss = (
+            loss / group_size
+        )
+
+        scaler.scale(
+            scaled_loss
+        ).backward()
+
+        train_loss_total += loss.item()
+
+        should_update = (
+            (step + 1) % GRADIENT_ACCUMULATION_STEPS == 0
+            or (step + 1) == len(train_loader)
+        )
+
+        if should_update:
+
+            scaler.unscale_(
+                optimizer
+            )
+
+            torch.nn.utils.clip_grad_norm_(
+                trainable_parameters,
+                max_norm=1.0
+            )
+
+            scaler.step(
+                optimizer
+            )
+
+            scaler.update()
+
+            optimizer.zero_grad(
+                set_to_none=True
+            )
+
+        progress.set_postfix(
+            loss=f"{loss.item():.4f}"
+        )
+
+    train_loss = (
+        train_loss_total /
+        max(len(train_loader), 1)
+    )
+
+
+    # ========================================================
+    # VALIDATION
+    # ========================================================
+
+    unet.eval()
+
+    validation_loss_total = 0.0
+
+    with torch.no_grad():
+
+        for batch in tqdm(
+            validation_loader,
+            desc="Validation"
+        ):
+
+            loss = calculate_loss(
+                batch,
+                training=False
+            )
+
+            validation_loss_total += loss.item()
+
+    validation_loss = (
+        validation_loss_total /
+        max(len(validation_loader), 1)
+    )
+
+
+    # ========================================================
+    # SAVE TRAINABLE PARAMETERS
+    # ========================================================
+
+    epoch_checkpoint = {}
+
+    for name, parameter in unet.named_parameters():
+
+        if parameter.requires_grad:
+
+            epoch_checkpoint[name] = (
+                parameter.detach()
+                .cpu()
+                .clone()
+            )
+
+    checkpoint_path = os.path.join(
+        OUTPUT_DIR,
+        f"trainable_epoch_{epoch + 1}.pt"
+    )
+
+    torch.save(
+        epoch_checkpoint,
+        checkpoint_path
+    )
+
+
+    # ========================================================
+    # RECORD TRAINING HISTORY
+    # ========================================================
+
+    epoch_result = {
+
+        "epoch": epoch + 1,
+
+        "train_loss": float(train_loss),
+
+        "validation_loss": float(validation_loss)
+
+    }
+
+    training_history.append(
+        epoch_result
+    )
+
+    with open(
+        os.path.join(
+            OUTPUT_DIR,
+            "training_history.json"
+        ),
+        "w"
+    ) as file:
+
+        json.dump(
+            training_history,
+            file,
+            indent=4
+        )
+
+
+    print(
+        f"\nEpoch {epoch + 1}/{EPOCHS}"
+    )
+
+    print(
+        f"Training Loss: {train_loss:.6f}"
+    )
+
+    print(
+        f"Validation Loss: {validation_loss:.6f}"
+    )
+
+    print(
+        "Saved:",
+        checkpoint_path
+    )
+
+    clear_memory()
+
+    print_gpu_memory(
+        f"After epoch {epoch + 1}"
+    )
+
+
+# ============================================================
+# 25. SAVE COMPLETE FINE-TUNED UNET
+# ============================================================
+
+print(
+    "\nSaving complete fine-tuned UNet..."
+)
+
+unet.save_pretrained(
+    UNET_OUTPUT_DIR,
+    safe_serialization=True
+)
+
+print(
+    "Saved UNet:",
+    UNET_OUTPUT_DIR
+)
+
+
+# ============================================================
+# 26. SAVE TRAINING CONFIGURATION
+# ============================================================
+
+training_config = {
+
+    "model_name": MODEL_NAME,
+
+    "image_size": IMAGE_SIZE,
+
+    "max_text_length": MAX_TEXT_LENGTH,
+
+    "max_images": MAX_IMAGES,
+
+    "training_images": TRAIN_IMAGES,
+
+    "validation_images": VALIDATION_IMAGES,
+
+    "batch_size": BATCH_SIZE,
+
+    "epochs": EPOCHS,
+
+    "learning_rate": LEARNING_RATE,
+
+    "weight_decay": WEIGHT_DECAY,
+
+    "gradient_accumulation_steps":
+        GRADIENT_ACCUMULATION_STEPS,
+
+    "caption_dropout": CAPTION_DROPOUT,
+
+    "trainable_blocks": NUM_TRAINABLE_BLOCKS,
+
+    "trainable_components": [
+        "last two UNet up blocks",
+        "conv_norm_out",
+        "conv_out"
+    ],
+
+    "mixed_precision": (
+        "fp16" if USE_FP16 else "fp32"
+    ),
+
+    "trainable_parameters": int(trainable_count),
+
+    "total_parameters": int(total_parameters)
+
+}
+
+with open(
+    os.path.join(
+        OUTPUT_DIR,
+        "training_config.json"
+    ),
+    "w"
+) as file:
+
+    json.dump(
+        training_config,
+        file,
+        indent=4
+    )
+
+
+# ============================================================
+# 27. FINISHED
+# ============================================================
+
+print("\n" + "=" * 60)
+
+print(
+    "STABLE DIFFUSION 1.5 FINE-TUNING COMPLETED"
+)
+
+print("=" * 60)
+
+print(
+    "Output directory:",
+    OUTPUT_DIR
+)
+
+print(
+    "UNet directory:",
+    UNET_OUTPUT_DIR
+)
+
+print(
+    "Training history:",
+    training_history
+)
+
+print_gpu_memory(
+    "Final GPU memory"
+)
+
+
+#------------------------------inference---------------------------------
+
+
+
+# ============================================================
+# STABLE DIFFUSION 1.5 INFERENCE
+# CPU LOADING + GPU OFFLOADING
+# MEMORY OPTIMIZED FOR 14.56 GB GPU
+# ============================================================
+
+import os
+import gc
+import torch
+
+from IPython.display import display
+
+from diffusers import (
+    StableDiffusionPipeline,
+    UNet2DConditionModel,
+    DPMSolverMultistepScheduler
+)
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+MODEL_NAME = (
+    "stable-diffusion-v1-5/"
+    "stable-diffusion-v1-5"
+)
+
+OUTPUT_DIR = (
+    "/kaggle/working/"
+    "stable_diffusion15_finetuned"
+)
+
+UNET_OUTPUT_DIR = os.path.join(
+    OUTPUT_DIR,
+    "unet"
+)
+
+EPOCH_TO_LOAD = None
+
+OUTPUT_IMAGE = os.path.join(
+    OUTPUT_DIR,
+    "demo_prediction.png"
+)
+
+DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+DTYPE = (
+    torch.float16
+    if DEVICE == "cuda"
+    else torch.float32
+)
+
+
+# ============================================================
+# 2. RELEASE UNUSED GPU MEMORY
+# ============================================================
+
+gc.collect()
+
+if torch.cuda.is_available():
+
+    torch.cuda.empty_cache()
+
+    torch.cuda.ipc_collect()
+
+    print(
+        "GPU free before loading:",
+        round(
+            torch.cuda.mem_get_info()[0] / 1024**3,
+            2
+        ),
+        "GB"
+    )
+
+
+if not os.path.isdir(UNET_OUTPUT_DIR):
+
+    raise FileNotFoundError(
+        UNET_OUTPUT_DIR
+    )
+
+
+# ============================================================
+# 3. LOAD FINE-TUNED UNET ON CPU
+# ============================================================
+
+print(
+    "\nLoading fine-tuned UNet on CPU..."
+)
+
+unet = UNet2DConditionModel.from_pretrained(
+
+    UNET_OUTPUT_DIR,
+
+    torch_dtype=DTYPE,
+
+    low_cpu_mem_usage=True,
+
+    use_safetensors=True,
+
+    device_map="cpu"
+
+)
+
+unet.eval()
+
+print(
+    "UNet loaded on CPU."
+)
+
+
+# ============================================================
+# 4. OPTIONAL EPOCH CHECKPOINT
+# ============================================================
+
+if EPOCH_TO_LOAD is not None:
+
+    checkpoint_path = os.path.join(
+        OUTPUT_DIR,
+        f"trainable_epoch_{EPOCH_TO_LOAD}.pt"
+    )
+
+    if not os.path.isfile(checkpoint_path):
+
+        raise FileNotFoundError(
+            checkpoint_path
+        )
+
+    print(
+        "Loading epoch checkpoint:",
+        checkpoint_path
+    )
+
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True
+    )
+
+    if "state_dict" in checkpoint:
+
+        checkpoint = checkpoint["state_dict"]
+
+    current_state = unet.state_dict()
+
+    compatible = {
+
+        name: value
+
+        for name, value in checkpoint.items()
+
+        if (
+            name in current_state
+            and current_state[name].shape == value.shape
+        )
+
+    }
+
+    if not compatible:
+
+        raise RuntimeError(
+            "No compatible epoch weights found."
+        )
+
+    unet.load_state_dict(
+        compatible,
+        strict=False
+    )
+
+    print(
+        "Loaded trainable tensors:",
+        len(compatible)
+    )
+
+    del checkpoint
+    del current_state
+    del compatible
+
+    gc.collect()
+
+
+# ============================================================
+# 5. LOAD COMPLETE PIPELINE ON CPU
+# ============================================================
+
+print(
+    "\nLoading Stable Diffusion pipeline on CPU..."
+)
+
+pipe = StableDiffusionPipeline.from_pretrained(
+
+    MODEL_NAME,
+
+    unet=unet,
+
+    torch_dtype=DTYPE,
+
+    low_cpu_mem_usage=True,
+
+    device_map="cpu",
+
+    safety_checker=None
+
+)
+
+del unet
+
+gc.collect()
+
+print(
+    "Complete Stable Diffusion pipeline loaded on CPU."
+)
+
+
+# ============================================================
+# 6. INFERENCE SCHEDULER
+# ============================================================
+
+pipe.scheduler = (
+    DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config
+    )
+)
+
+
+# ============================================================
+# 7. ENABLE CPU OFFLOADING
+# ============================================================
+
+if DEVICE == "cuda":
+
+    # Move individual components to GPU when required.
+    # The pipeline remains CPU-loaded initially.
+
+    pipe.enable_model_cpu_offload(
+        gpu_id=0
+    )
+
+    print(
+        "Model CPU offloading enabled."
+    )
+
+else:
+
+    pipe.to("cpu")
+
+    print(
+        "CPU inference enabled."
+    )
+
+
+# ============================================================
+# 8. PROMPT
+# ============================================================
+
+prompt = (
+
+    "A majestic snow leopard sitting on a rocky "
+    "mountain cliff overlooking a vast Himalayan "
+    "mountain range, snow-covered peaks, soft "
+    "morning sunlight, ultra-realistic wildlife "
+    "photography, highly detailed fur, sharp focus, "
+    "natural colors, cinematic composition"
+
+)
+
+negative_prompt = (
+
+    "blurry, low quality, distorted, deformed, "
+    "bad anatomy, unrealistic proportions, "
+    "poor details, low resolution"
+
+)
+
+
+# ============================================================
+# 9. IMAGE GENERATION
+# ============================================================
+
+generator = torch.Generator(
+    device="cpu"
+).manual_seed(42)
+
+print(
+    "\nGenerating image..."
+)
+
+with torch.inference_mode():
+
+    result = pipe(
+
+        prompt=prompt,
+
+        negative_prompt=negative_prompt,
+
+        height=512,
+
+        width=512,
+
+        num_inference_steps=25,
+
+        guidance_scale=7.5,
+
+        num_images_per_prompt=1,
+
+        generator=generator
+
+    )
+
+generated_image = result.images[0]
+
+
+# ============================================================
+# 10. SAVE AND DISPLAY
+# ============================================================
+
+generated_image.save(
+    OUTPUT_IMAGE
+)
+
+display(
+    generated_image
+)
+
+print(
+    "\nImage generated successfully."
+)
+
+print(
+    "Saved:",
+    OUTPUT_IMAGE
+)
+
+if torch.cuda.is_available():
+
+    print(
+        "GPU allocated:",
+        round(
+            torch.cuda.memory_allocated() / 1024**3,
+            2
+        ),
+        "GB"
+    )
