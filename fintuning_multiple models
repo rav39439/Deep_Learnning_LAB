@@ -3067,6 +3067,31 @@ elif (
     embedding_dropout = None
 
 
+# Falcon
+elif "falcon" in MODEL_NAME.lower():
+
+    decoder_layers = model.transformer.h
+
+    embedding_modules = [
+        model.transformer.word_embeddings
+    ]
+
+    final_norm = model.transformer.ln_f
+    embedding_dropout = None
+
+
+# Phi-2
+elif "phi" in MODEL_NAME.lower():
+
+    decoder_layers = model.model.layers
+
+    embedding_modules = [
+        model.model.embed_tokens
+    ]
+
+    final_norm = model.model.final_layernorm
+    embedding_dropout = model.model.embed_dropout
+
 elif (
     "qwen" in MODEL_NAME.lower()
 ):
