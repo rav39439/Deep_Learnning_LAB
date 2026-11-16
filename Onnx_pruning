@@ -1,0 +1,295 @@
+# =========================================================
+# MODEL CONFIGURATION — MATCHES THE CHECKPOINT
+# =========================================================
+
+NUM_LAYERS = 18
+NUM_HEADS = 8
+
+D_MODEL = 512
+DFF = 512
+
+VOCAB_SIZE = 30527
+
+MAX_POSITION_ENCODING = 512
+INPUT_SEQ_LEN = 512
+
+DROPOUT = 0.1
+
+WEIGHTS_PATH = (
+    "/kaggle/input/datasets/ravckumar/"
+    "questionandanswerfinetune-512-14-1/"
+    "final_transformer64.weights.h5"
+)
+
+ONNX_PATH = "/kaggle/working/transformer_pruned_fp16.onnx"
+
+# =========================================================
+# BUILD MODEL
+# =========================================================
+
+model = DecoderOnlyTransformer(
+    num_layers=NUM_LAYERS,
+    d_model=D_MODEL,
+    num_heads=NUM_HEADS,
+    dff=DFF,
+    vocab_size=VOCAB_SIZE,
+    maximum_position_encoding=MAX_POSITION_ENCODING,
+    rate=DROPOUT
+)
+
+# Build all model variables before loading weights
+dummy_input = tf.zeros(
+    (1, INPUT_SEQ_LEN),
+    dtype=tf.int32
+)
+
+_ = model(dummy_input, training=False)
+
+print("Model built successfully.")
+print("Decoder blocks:", len(model.dec_layers))
+print("Embedding shape:", model.embedding.weights[0].shape)
+print("Output shape:", model.final_layer.weights[0].shape)
+
+# =========================================================
+# LOAD CHECKPOINT
+# =========================================================
+
+model.load_weights(WEIGHTS_PATH)
+
+print("\nCheckpoint loaded successfully.")
+
+assert len(model.dec_layers) == 18
+assert model.embedding.weights[0].shape == (30527, 512)
+assert model.final_layer.weights[0].shape == (512, 30527)
+
+print("All checkpoint dimensions verified.")
+print("Total parameters:", model.count_params())
+
+import tf2onnx
+import onnx
+import numpy as np
+import tensorflow as tf
+
+# =========================================================
+# EXPORT TO ONNX
+# =========================================================
+
+@tf.function(
+    input_signature=[
+        tf.TensorSpec(
+            shape=[None, INPUT_SEQ_LEN],
+            dtype=tf.int32,
+            name="input_ids"
+        )
+    ]
+)
+def serving_function(input_ids):
+    logits = model(input_ids, training=False)
+    return {"logits": logits}
+
+
+onnx_model, _ = tf2onnx.convert.from_function(
+    serving_function,
+    input_signature=serving_function.input_signature,
+    opset=17
+)
+
+onnx.checker.check_model(onnx_model)
+
+onnx.save(
+    onnx_model,
+    "/kaggle/working/transformer_original.onnx"
+)
+
+print("ONNX conversion completed.")
+
+# =========================================================
+# ONNX WEIGHT PRUNING
+# =========================================================
+
+from onnx import numpy_helper
+
+PRUNING_RATIO = 0.20
+
+onnx_model = onnx.load(
+    "/kaggle/working/transformer_original.onnx"
+)
+
+pruned_count = 0
+total_pruned = 0
+total_weights = 0
+
+for initializer in onnx_model.graph.initializer:
+
+    # weights = numpy_helper.to_array(initializer)
+    weights = numpy_helper.to_array(initializer).copy()
+
+    # Prune only 512 x 512 weight matrices
+    if weights.ndim == 2 and weights.shape == (512, 512):
+
+        abs_weights = np.abs(weights)
+
+        threshold = np.quantile(
+            abs_weights,
+            PRUNING_RATIO
+        )
+
+        mask = abs_weights <= threshold
+
+        total_pruned += np.count_nonzero(mask)
+        total_weights += weights.size
+
+        weights[mask] = 0
+
+        initializer.CopyFrom(
+            numpy_helper.from_array(
+                weights,
+                name=initializer.name
+            )
+        )
+
+        pruned_count += 1
+
+
+onnx.checker.check_model(onnx_model)
+
+onnx.save(
+    onnx_model,
+    "/kaggle/working/transformer_pruned.onnx"
+)
+
+print("Pruning completed.")
+print("Matrices pruned:", pruned_count)
+print("Weights pruned:", total_pruned)
+print("Total eligible weights:", total_weights)
+
+if total_weights:
+    print(
+        "Actual sparsity:",
+        round(100 * total_pruned / total_weights, 2),
+        "%"
+    )
+
+
+# =========================================================
+# FP16 CONVERSION
+# =========================================================
+
+from onnxconverter_common import float16
+
+pruned_model = onnx.load(
+    "/kaggle/working/transformer_pruned.onnx"
+)
+
+fp16_model = float16.convert_float_to_float16(
+    pruned_model,
+    keep_io_types=True
+)
+
+onnx.checker.check_model(fp16_model)
+
+onnx.save(
+    fp16_model,
+    ONNX_PATH
+)
+
+print("FP16 conversion completed.")
+print("Final model:", ONNX_PATH)
+
+
+# =========================================================
+# ONNX RUNTIME TEST
+# =========================================================
+
+import onnxruntime as ort
+
+session = ort.InferenceSession(
+    ONNX_PATH,
+    providers=["CPUExecutionProvider"]
+)
+
+test_input = np.random.randint(
+    0,
+    VOCAB_SIZE,
+    size=(1, INPUT_SEQ_LEN),
+    dtype=np.int32
+)
+
+input_name = session.get_inputs()[0].name
+output_name = session.get_outputs()[0].name
+
+onnx_output = session.run(
+    [output_name],
+    {input_name: test_input}
+)[0]
+
+print("ONNX input shape:", test_input.shape)
+print("ONNX output shape:", onnx_output.shape)
+print("Output dtype:", onnx_output.dtype)
+print("All outputs finite:", np.isfinite(onnx_output).all())
+
+assert onnx_output.shape == (1, INPUT_SEQ_LEN, VOCAB_SIZE)
+
+print("\nFinal ONNX model tested successfully.")
+
+
+#---------------second round of pruning---------------
+
+import onnx
+from onnxconverter_common import float16
+
+PRUNED_ONNX_PATH = "/kaggle/working/transformer_pruned.onnx"
+FP16_ONNX_PATH = "/kaggle/working/transformer2_pruned_fp16.onnx"
+
+# Always start from the original pruned FP32 model
+pruned_model = onnx.load(PRUNED_ONNX_PATH)
+
+# Operations that should remain in FP32
+op_block_list = [
+    "Less",
+    "LessOrEqual",
+    "Greater",
+    "GreaterOrEqual",
+    "Equal",
+    "Where",
+    "Cast",
+    "Shape",
+    "Gather",
+    "Range",
+    "Mul",
+    "Add",
+    "Sub",
+    "Div",
+    "Pow",
+    "Sqrt"
+]
+
+fp16_model = float16.convert_float_to_float16(
+    pruned_model,
+    keep_io_types=True,
+    op_block_list=op_block_list,
+    max_finite_val=65504.0,
+    disable_shape_infer=False
+)
+
+# Validate graph
+onnx.checker.check_model(fp16_model)
+
+# Save
+onnx.save(fp16_model, FP16_ONNX_PATH)
+
+print("Mixed precision conversion completed!")
+
+
+#------------inference---------------
+
+FP16_ONNX_PATH = "/kaggle/working/transformer2_pruned_fp16.onnx"
+
+import onnxruntime as ort
+
+session = ort.InferenceSession(
+    FP16_ONNX_PATH,
+    providers=["CPUExecutionProvider"]
+)
+
+print("FP16 model loaded successfully!")
