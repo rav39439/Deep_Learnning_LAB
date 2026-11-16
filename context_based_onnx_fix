@@ -1,0 +1,637 @@
+!pip install -q transformers onnx onnxruntime
+
+import onnx
+ONNX_MODEL_PATH = "/kaggle/input/datasets/ravckumar/onnx-model/transformer_original.onnx"
+
+onnx_model = onnx.load(ONNX_MODEL_PATH)
+
+target = "decoder_only_transformer_6_1/226748:0"
+
+print("========== GRAPH INPUTS ==========")
+for value in onnx_model.graph.input:
+    print("\nName:", value.name)
+    print("Type:", value.type)
+
+print("\n========== NODES CONSUMING TARGET ==========")
+count = 0
+
+for node in onnx_model.graph.node:
+    if target in node.input:
+        count += 1
+        print("\nNode name:", node.name)
+        print("Operation:", node.op_type)
+        print("All inputs:", list(node.input))
+        print("All outputs:", list(node.output))
+
+print("\nTotal consuming nodes:", count)
+
+print("\n========== INITIALIZERS ==========")
+for initializer in onnx_model.graph.initializer:
+    print(initializer.name, list(initializer.dims))
+
+
+
+sample_output="========== GRAPH INPUTS ==========
+
+Name: input_ids
+Type: tensor_type {
+  elem_type: 6
+  shape {
+    dim {
+      dim_param: "unk__4282"
+    }
+    dim {
+      dim_value: 512
+    }
+  }
+}
+
+
+Name: decoder_only_transformer_6_1/226748:0
+Type: tensor_type {
+  elem_type: 1
+  shape {
+    dim {
+      dim_value: 1
+    }
+    dim {
+      dim_value: 512
+    }
+    dim {
+      dim_value: 512
+    }
+  }
+}
+
+
+========== NODES CONSUMING TARGET ==========
+
+Total consuming nodes: 0
+
+========== INITIALIZERS ==========
+decoder_only_transformer_6_1/strided_slice_2__2861 [1, 512, 512]
+decoder_only_transformer_6_1/embedding_6_1/strided_slice:0 []
+decoder_only_transformer_6_1/embedding_6_1/GatherV2/ReadVariableOp:0 [30527, 512]
+decoder_only_transformer_6_1/dense_338_1/Cast/ReadVariableOp:0 [512, 30527]
+decoder_only_transformer_6_1/dense_338_1/BiasAdd/ReadVariableOp:0 [30527]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/sequential_165_1/dense_337_1/Cast/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/sequential_165_1/dense_337_1/BiasAdd/ReadVariableOp:0 [512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/sequential_165_1/dense_336_1/Gelu/mul/x:0 []
+decoder_only_transformer_6_1/decoder_only_layer_165_1/sequential_165_1/dense_336_1/Cast/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/sequential_165_1/dense_336_1/BiasAdd/ReadVariableOp:0 [512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/layer_normalization_331_1/Reshape_1:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/layer_normalization_331_1/Reshape:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/layer_normalization_330_1/Reshape_1:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/layer_normalization_330_1/Reshape:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/causal_self_attention_with_a_li_bi_165_1/MatMul_5/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/causal_self_attention_with_a_li_bi_165_1/MatMul_2/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/causal_self_attention_with_a_li_bi_165_1/MatMul_1/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_165_1/causal_self_attention_with_a_li_bi_165_1/MatMul/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/sequential_164_1/dense_335_1/Cast/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/sequential_164_1/dense_335_1/BiasAdd/ReadVariableOp:0 [512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/sequential_164_1/dense_334_1/Cast/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/sequential_164_1/dense_334_1/BiasAdd/ReadVariableOp:0 [512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/layer_normalization_329_1/Reshape_1:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/layer_normalization_329_1/Reshape:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/layer_normalization_328_1/Reshape_1:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/layer_normalization_328_1/Reshape:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/causal_self_attention_with_a_li_bi_164_1/MatMul_5/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/causal_self_attention_with_a_li_bi_164_1/MatMul_2/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/causal_self_attention_with_a_li_bi_164_1/MatMul_1/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_164_1/causal_self_attention_with_a_li_bi_164_1/MatMul/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/sequential_163_1/dense_333_1/Cast/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/sequential_163_1/dense_333_1/BiasAdd/ReadVariableOp:0 [512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/sequential_163_1/dense_332_1/Cast/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/sequential_163_1/dense_332_1/BiasAdd/ReadVariableOp:0 [512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/layer_normalization_327_1/Reshape_1:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/layer_normalization_327_1/Reshape:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/layer_normalization_326_1/Reshape_1:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/layer_normalization_326_1/Reshape:0 [1, 1, 512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/causal_self_attention_with_a_li_bi_163_1/MatMul_5/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/causal_self_attention_with_a_li_bi_163_1/MatMul_2/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/causal_self_attention_with_a_li_bi_163_1/MatMul_1/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_163_1/causal_self_attention_with_a_li_bi_163_1/MatMul/ReadVariableOp:0 [512, 512]
+decoder_only_transformer_6_1/decoder_only_layer_162_1/sequential_162_1/dense_331_1/Cast/ReadVariableOp:0 [512, 512]"
+
+
+import onnxruntime as ort
+import numpy as np
+
+session = ort.InferenceSession(
+    ONNX_MODEL_PATH,
+    providers=["CPUExecutionProvider"]
+)
+
+input_name = "input_ids"
+extra_name = "decoder_only_transformer_6_1/226748:0"
+
+output_name = session.get_outputs()[0].name
+
+# Test input
+input_ids = np.zeros((1, 512), dtype=np.int32)
+
+# Second input: zeros
+extra_zero = np.zeros((1, 512, 512), dtype=np.float32)
+
+# Second input: ones
+extra_one = np.ones((1, 512, 512), dtype=np.float32)
+
+# Predictions
+output_zero = session.run(
+    [output_name],
+    {
+        input_name: input_ids,
+        extra_name: extra_zero
+    }
+)[0]
+
+output_one = session.run(
+    [output_name],
+    {
+        input_name: input_ids,
+        extra_name: extra_one
+    }
+)[0]
+
+print("Output shape:", output_zero.shape)
+
+print(
+    "Maximum difference:",
+    np.max(np.abs(output_zero - output_one))
+)
+
+print(
+    "Outputs identical:",
+    np.allclose(output_zero, output_one)
+)
+
+
+import onnx
+
+model = onnx.load(ONNX_MODEL_PATH)
+
+target = "decoder_only_transformer_6_1/226748:0"
+
+# Remove the unused graph input declaration
+remaining_inputs = [
+    value for value in model.graph.input
+    if value.name != target
+]
+
+del model.graph.input[:]
+model.graph.input.extend(remaining_inputs)
+
+# Validate the modified graph
+onnx.checker.check_model(model)
+
+# Save modified model
+FIXED_ONNX_PATH = "/kaggle/working/transformer_fixed.onnx"
+
+onnx.save(model, FIXED_ONNX_PATH)
+
+print("Modified ONNX model saved.")
+print("Remaining inputs:")
+
+for value in model.graph.input:
+    print(value.name)
+
+
+sample_ouput="Modified ONNX model saved.
+Remaining inputs:
+input_ids"
+
+
+import onnxruntime as ort
+import numpy as np
+FIXED_ONNX_PATH="/kaggle/working/transformer_fixed.onnx"
+session = ort.InferenceSession(
+    FIXED_ONNX_PATH,
+    providers=["CPUExecutionProvider"]
+)
+
+print("Inputs:", [x.name for x in session.get_inputs()])
+
+input_ids = np.zeros((1, 512), dtype=np.int32)
+
+output = session.run(
+    None,
+    {"input_ids": input_ids}
+)[0]
+
+print("Output shape:", output.shape)
+print("Output contains NaN:", np.isnan(output).any())
+
+
+sample_outputt="Inputs: ['input_ids']
+Output shape: (1, 512, 30527)
+Output contains NaN: False
+add Codeadd Markdown"
+
+
+
+
+# ============================================================
+# ONNX DECODER-ONLY TRANSFORMER
+# CONTEXT + QUESTION ANSWERING INFERENCE
+# ============================================================
+
+import os
+import numpy as np
+import onnxruntime as ort
+from transformers import BertTokenizerFast
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+ONNX_MODEL_PATH = (
+    "/kaggle/working/transformer_fixed.onnx"
+)
+
+TOKENIZER_PATH = (
+    "/kaggle/input/datasets/ravckumar/"
+    "instruction_tuning3/tokenizer"
+)
+
+SEQ_LEN = 512
+MAX_GEN = 150
+
+# Replace with the exact END_IDS used during training.
+# This example assumes [SEP] is your stopping token.
+
+
+# ============================================================
+# 2. LOAD TOKENIZER
+# ============================================================
+
+if os.path.isdir(TOKENIZER_PATH):
+
+    tokenizer = BertTokenizerFast.from_pretrained(
+        TOKENIZER_PATH
+    )
+    print("Saved tokenizer loaded.")
+
+else:
+
+    tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+
+    special_tokens = {
+        "additional_special_tokens": [
+            "<question>",
+            "</question>",
+            "<answer>",
+            "</answer>",
+            "<END>"
+        ]
+    }
+    
+    tokenizer.add_special_tokens(special_tokens)
+
+VOCAB_SIZE = tokenizer.vocab_size + len(special_tokens["additional_special_tokens"])
+
+
+print("\nTokenizer information:")
+print("Vocabulary size:", tokenizer.vocab_size)
+print("Total tokenizer length:", len(tokenizer))
+print("PAD token ID:", tokenizer.pad_token_id)
+print("SEP token ID:", tokenizer.sep_token_id)
+
+# ============================================================
+# 3. LOAD ONNX MODEL
+# ============================================================
+
+if not os.path.isfile(ONNX_MODEL_PATH):
+    raise FileNotFoundError(
+        f"ONNX model not found: {ONNX_MODEL_PATH}"
+    )
+
+
+session = ort.InferenceSession(
+    ONNX_MODEL_PATH,
+    providers=["CPUExecutionProvider"]
+)
+
+input_name = session.get_inputs()[0].name
+output_name = session.get_outputs()[0].name
+
+print("\nONNX model loaded successfully.")
+
+print("Input name:", input_name)
+print("Input shape:", session.get_inputs()[0].shape)
+
+print("Output name:", output_name)
+print("Output shape:", session.get_outputs()[0].shape)
+
+
+# ============================================================
+# 4. VALIDATE MODEL INPUT AND OUTPUT
+# ============================================================
+
+if len(session.get_inputs()) != 1:
+    raise ValueError(
+        "Expected exactly one ONNX input."
+    )
+
+if session.get_inputs()[0].type != "tensor(int32)":
+    raise TypeError(
+        "Expected ONNX input type tensor(int32)."
+    )
+
+model_vocab_size = session.get_outputs()[0].shape[-1]
+
+if isinstance(model_vocab_size, int):
+
+    print("\nModel output vocabulary:", model_vocab_size)
+
+    if len(tokenizer) != model_vocab_size:
+
+        print(
+            "\nWARNING: Tokenizer/model vocabulary mismatch!"
+        )
+
+        print(
+            "Tokenizer length:",
+            len(tokenizer)
+        )
+
+        print(
+            "Model vocabulary:",
+            model_vocab_size
+        )
+
+
+# ============================================================
+# 5. END TOKEN CONFIGURATION
+# ============================================================
+
+# IMPORTANT:
+# Use the exact END_IDS from your training code.
+# Here SEP is used as an example.
+
+END_IDS = [tokenizer.sep_token_id]
+
+if any(token_id is None for token_id in END_IDS):
+    raise ValueError("Invalid END_IDS configuration.")
+
+print("\nEnd token IDs:", END_IDS)
+
+
+# ============================================================
+# 6. ONNX MODEL GENERATION FUNCTION
+# ============================================================
+
+def generate_answer_onnx(
+    context,
+    question,
+    max_gen=MAX_GEN
+):
+
+    # --------------------------------------------------------
+    # Construct prompt
+    # --------------------------------------------------------
+
+    prompt = (
+        f"Context: {context}\n"
+        f"Question: {question}\n"
+        f"Answer:"
+    )
+
+    # --------------------------------------------------------
+    # Tokenization
+    # --------------------------------------------------------
+
+    token_ids = tokenizer.encode(
+        prompt,
+        add_special_tokens=False
+    )
+
+    if not token_ids:
+        raise ValueError(
+            "The input context and question produced no tokens."
+        )
+
+    # Preserve the end of the prompt if it exceeds the window.
+    token_ids = token_ids[-(SEQ_LEN - 1):]
+
+    generated_ids = []
+
+    # --------------------------------------------------------
+    # Autoregressive generation
+    # --------------------------------------------------------
+
+    for step in range(max_gen):
+
+        # Combine prompt and previously generated tokens.
+        context_ids = (
+            token_ids + generated_ids
+        )[-SEQ_LEN:]
+
+        actual_length = len(context_ids)
+
+        # Fixed-length right padding.
+        padded_ids = (
+            context_ids
+            + [tokenizer.pad_token_id] *
+            (SEQ_LEN - actual_length)
+        )
+
+        input_array = np.asarray(
+            [padded_ids],
+            dtype=np.int32
+        )
+
+        # ----------------------------------------------------
+        # ONNX inference
+        # ----------------------------------------------------
+
+        logits = session.run(
+            [output_name],
+            {
+                input_name: input_array
+            }
+        )[0]
+
+        # Select logits at the last actual token position.
+        next_token_logits = logits[
+            0,
+            actual_length - 1,
+            :
+        ]
+
+        # Greedy decoding.
+        next_id = int(
+            np.argmax(next_token_logits)
+        )
+
+        # ----------------------------------------------------
+        # Validate token ID
+        # ----------------------------------------------------
+
+        if next_id >= len(tokenizer):
+
+            raise ValueError(
+                f"Generated token ID {next_id} is outside "
+                f"the tokenizer vocabulary ({len(tokenizer)}). "
+                "Check the tokenizer used during training."
+            )
+
+        generated_ids.append(next_id)
+
+        # ----------------------------------------------------
+        # Stop-token checking
+        # ----------------------------------------------------
+
+        if (
+            len(generated_ids) >= len(END_IDS)
+            and generated_ids[-len(END_IDS):] == END_IDS
+        ):
+
+            generated_ids = generated_ids[:-len(END_IDS)]
+
+            break
+
+    # --------------------------------------------------------
+    # Decode answer
+    # --------------------------------------------------------
+
+    answer = tokenizer.decode(
+        generated_ids,
+        skip_special_tokens=True
+    ).strip()
+
+    return answer
+
+
+# ============================================================
+# 7. EXAMPLE 1: CONTEXT-BASED QUESTION ANSWERING
+# ============================================================
+
+context = """
+Artificial intelligence is a branch of computer science
+that focuses on building machines capable of performing
+tasks that typically require human intelligence.
+
+Machine learning is a subset of artificial intelligence.
+It allows computers to learn patterns from data and make
+predictions without being explicitly programmed for every task.
+
+Deep learning is a subset of machine learning that uses
+neural networks with multiple layers to learn complex patterns.
+"""
+
+question = """
+What is the relationship between artificial intelligence,
+machine learning, and deep learning?
+"""
+
+answer = generate_answer_onnx(
+    context=context,
+    question=question
+)
+
+print("\n" + "=" * 65)
+print("EXAMPLE 1: CONTEXT-BASED QUESTION ANSWERING")
+print("=" * 65)
+
+print("\nCONTEXT:\n")
+print(context)
+
+print("\nQUESTION:\n")
+print(question)
+
+print("\nGENERATED ANSWER:\n")
+print(answer)
+
+
+# ============================================================
+# 8. EXAMPLE 2: ANOTHER CONTEXT-BASED QUESTION
+# ============================================================
+
+context_2 = """
+The human heart is a muscular organ that pumps blood
+throughout the body.
+
+It has four chambers: two atria and two ventricles.
+The right side pumps blood to the lungs, while the
+left side pumps oxygen-rich blood to the rest of the body.
+
+The heart also contains valves that prevent blood
+from flowing backward.
+"""
+
+question_2 = """
+How many chambers does the human heart have,
+and what are their functions?
+"""
+
+answer_2 = generate_answer_onnx(
+    context=context_2,
+    question=question_2
+)
+
+print("\n" + "=" * 65)
+print("EXAMPLE 2: CONTEXT-BASED QUESTION ANSWERING")
+print("=" * 65)
+
+print("\nCONTEXT:\n")
+print(context_2)
+
+print("\nQUESTION:\n")
+print(question_2)
+
+print("\nGENERATED ANSWER:\n")
+print(answer_2)
+
+
+# ============================================================
+# 9. INTERACTIVE CONTEXT + QUESTION INFERENCE
+# ============================================================
+
+print("\n" + "=" * 65)
+print("INTERACTIVE ONNX TRANSFORMER")
+print("=" * 65)
+
+print("Enter your context and question.")
+print("Type 'exit' to stop.")
+
+while True:
+
+    print("\n" + "-" * 65)
+
+    context_input = input(
+        "\nEnter context (or exit):\n"
+    ).strip()
+
+    if context_input.lower() in ["exit", "quit"]:
+        print("Inference stopped.")
+        break
+
+    if not context_input:
+        print("Context cannot be empty.")
+        continue
+
+    question_input = input(
+        "\nEnter your question:\n"
+    ).strip()
+
+    if question_input.lower() in ["exit", "quit"]:
+        print("Inference stopped.")
+        break
+
+    if not question_input:
+        print("Question cannot be empty.")
+        continue
+
+    answer = generate_answer_onnx(
+        context=context_input,
+        question=question_input,
+        max_gen=MAX_GEN
+    )
+
+    print("\nGENERATED ANSWER:")
+    print(answer)
+
+    print("-" * 65)
+
+
