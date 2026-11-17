@@ -475,6 +475,7 @@ def expand_transformer_layers(model, num_new_layers, flag=True):
 # #-----------------------------------------------------------------------------------
 
 #-------------------------training_----------------------
+
 # =========================================================
 # INSTRUCTION TUNING FROM A PRETRAINED NEXT-TOKEN MODEL
 # JSONL DATASET: CONTEXT + QUESTION -> ANSWER
@@ -554,6 +555,11 @@ OPTIMIZER_STATE_PREFIX = os.path.join(
     optimizer_dir,
     "optimizer_state"
 )
+OPTIMIZER_SAVE_PREFIX=os.path.join(
+    OUTPUT_DIR,
+    "optimizer_state"
+)
+
 
 
 # =========================================================
@@ -1793,13 +1799,13 @@ print(
 tf.train.Checkpoint(
     optimizer=optimizer
 ).write(
-    OPTIMIZER_STATE_PREFIX
+    OPTIMIZER_SAVE_PREFIX
 )
 
 
 print(
     "Optimizer state saved:",
-    OPTIMIZER_STATE_PREFIX
+    OPTIMIZER_SAVE_PREFIX
 )
 
 
@@ -2023,5 +2029,4 @@ print("\n====================================")
 print("INSTRUCTION TUNING COMPLETED")
 
 print("====================================")
-
 
