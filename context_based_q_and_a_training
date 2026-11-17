@@ -1,0 +1,2027 @@
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from collections import defaultdict
+import string
+import tensorflow as tf
+import re
+import os
+import time
+from tensorflow import keras
+from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import ModelCheckpoint
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+import numpy as np
+import re
+# -------------------------
+# Parameters
+# -------------------------
+TRAIN_RATIO = 0.96
+SEQ_LEN = 256
+STRIDE = 256
+# PER_GPU_BATCH_SIZE = 38
+# GLOBAL_BATCH_SIZE  = 76
+BATCH_SIZE = 24
+BUFFER_SIZE = 10000
+EMBED_DIM = 256
+NUM_HEADS = 8
+NUM_LAYERS = 31
+DFF = 1024
+DROPOUT = 0.1
+# T
+EPOCHS =2
+INITIAL_LR = 2e-4
+MIN_LR = 9e-5
+WARMUP_EPOCHS = 1
+WEIGHT_DECAY = 0.01
+# ---------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------
+SEED = 42
+
+# -------------------------
+# 1. Read text file
+# -------------------------
+
+
+
+# --------------------------transformer---------------------------------------
+
+def get_angles(pos, i, d_model):
+    angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
+    return pos * angle_rates
+
+def positional_encoding(position, d_model):
+    angle_rads = get_angles(np.arange(position)[:, np.newaxis],
+                            np.arange(d_model)[np.newaxis, :],
+                            d_model)
+    angle_rads[:, 0::2] = np.sin(angle_rads[:, 0::2])
+    angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
+    pos_encoding = angle_rads[np.newaxis, ...].astype(np.float32)
+    return tf.constant(pos_encoding)
+
+def create_look_ahead_mask(size):
+    mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
+    return mask  # (seq_len, seq_len)
+
+# -------------------------
+# MHA and FFN (same as you had)
+# -------------------------
+def scaled_dot_product_attention(q, k, v, mask):
+    matmul_qk = tf.matmul(q, k, transpose_b=True)
+    dk = tf.cast(tf.shape(k)[-1], tf.float32)
+    scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
+    if mask is not None:
+        # mask shape should broadcast to (..., seq_len_q, seq_len_k)
+        scaled_attention_logits += (mask * -1e9)
+    attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
+    output = tf.matmul(attention_weights, v)
+    return output, attention_weights
+
+    
+class MultiHeadAttention(tf.keras.layers.Layer):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        assert d_model % num_heads == 0
+        self.num_heads = num_heads
+        self.d_model = d_model
+        self.depth = d_model // num_heads
+        self.wq = tf.keras.layers.Dense(d_model)
+        self.wk = tf.keras.layers.Dense(d_model)
+        self.wv = tf.keras.layers.Dense(d_model)
+        self.dense = tf.keras.layers.Dense(d_model)
+
+    def split_heads(self, x, batch_size):
+        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
+        return tf.transpose(x, perm=[0, 2, 1, 3])
+
+    def call(self, v, k, q, mask):
+        batch_size = tf.shape(q)[0]
+        q = self.wq(q); k = self.wk(k); v = self.wv(v)
+        q = self.split_heads(q, batch_size)
+        k = self.split_heads(k, batch_size)
+        v = self.split_heads(v, batch_size)
+        scaled_attention, attn_weights = scaled_dot_product_attention(q, k, v, mask)
+        scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])
+        concat = tf.reshape(scaled_attention, (batch_size, -1, self.d_model))
+        out = self.dense(concat)
+        return out, attn_weights
+
+def point_wise_feed_forward_network(d_model, dff):
+    return tf.keras.Sequential([
+        tf.keras.layers.Dense(dff, activation=tf.nn.gelu),
+        tf.keras.layers.Dense(d_model)
+    ])
+
+class DecoderOnlyLayer(tf.keras.layers.Layer):
+    """Single decoder-only layer: masked self-attention + feedforward"""
+    def __init__(self, d_model, num_heads, dff, rate=0.05):
+        super(DecoderOnlyLayer, self).__init__()
+        self.mha = MultiHeadAttention(d_model, num_heads)
+        self.ffn = point_wise_feed_forward_network(d_model, dff)
+
+        # Pre-LayerNorm
+        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+
+        # Dropout
+        self.dropout1 = tf.keras.layers.Dropout(rate)
+        self.dropout2 = tf.keras.layers.Dropout(rate)
+
+    def call(self, x, training, look_ahead_mask=None):
+        # Pre-norm before masked self-attention
+        x_norm = self.layernorm1(x)
+        attn_output, _ = self.mha(x_norm, x_norm, x_norm, look_ahead_mask)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = x + attn_output
+
+        # Pre-norm before FFN
+        out1_norm = self.layernorm2(out1)
+        ffn_output = self.ffn(out1_norm)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        out2 = out1 + ffn_output
+
+        return out2
+
+
+
+class DecoderOnlyTransformer(tf.keras.Model):
+
+    def __init__(
+        self,
+        num_layers,
+        d_model,
+        num_heads,
+        dff,
+        vocab_size,
+        maximum_position_encoding,
+        rate=0.05,
+        **kwargs
+    ):
+        super(DecoderOnlyTransformer, self).__init__(**kwargs)
+
+        self.num_layers = num_layers
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.dff = dff
+        self.vocab_size = vocab_size
+        self.maximum_position_encoding = maximum_position_encoding
+        self.rate = rate
+
+        self.embedding = tf.keras.layers.Embedding(
+            vocab_size,
+            d_model
+        )
+
+        self.pos_encoding = positional_encoding(
+            maximum_position_encoding,
+            d_model
+        )
+
+        self.dec_layers = [
+            DecoderOnlyLayer(
+                d_model,
+                num_heads,
+                dff,
+                rate
+            )
+            for _ in range(num_layers)
+        ]
+
+        self.dropout = tf.keras.layers.Dropout(rate)
+
+        self.final_layer = tf.keras.layers.Dense(vocab_size)
+
+    def call(self, x, training=False, look_ahead_mask=None):
+
+        seq_len = tf.shape(x)[1]
+
+        if look_ahead_mask is None:
+            look_ahead_mask = create_look_ahead_mask(seq_len)
+
+        x = self.embedding(x)
+
+        x *= tf.math.sqrt(
+            tf.cast(self.d_model, tf.float32)
+        )
+
+        x += self.pos_encoding[:, :seq_len, :]
+
+        x = self.dropout(
+            x,
+            training=training
+        )
+
+        for i in range(self.num_layers):
+
+            x = self.dec_layers[i](
+                x,
+                training=training,
+                look_ahead_mask=look_ahead_mask
+            )
+
+        logits = self.final_layer(x)
+
+        return logits
+
+    def get_config(self):
+
+        config = super().get_config()
+
+        config.update({
+            "num_layers": self.num_layers,
+            "d_model": self.d_model,
+            "num_heads": self.num_heads,
+            "dff": self.dff,
+            "vocab_size": self.vocab_size,
+            "maximum_position_encoding": self.maximum_position_encoding,
+            "rate": self.rate,
+        })
+
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+
+def expand_transformer_layers(model, num_new_layers, flag=True):
+    """
+    Expand an existing DecoderOnlyTransformer without modifying
+    its pretrained weights.
+
+    Parameters
+    ----------
+    model : DecoderOnlyTransformer
+        Existing, built Transformer model.
+
+    num_new_layers : int
+        Number of new Transformer layers to add.
+
+    flag : bool
+        True  -> Expand model and freeze original layers.
+        False -> Return original model unchanged.
+
+    Returns
+    -------
+    expanded_model : DecoderOnlyTransformer
+    """
+
+    print("\n" + "=" * 60)
+    print("       TRANSFORMER ARCHITECTURE EXPANSION")
+    print("=" * 60)
+
+    # --------------------------------------------------
+    # 1. Check flag
+    # --------------------------------------------------
+
+    if not flag:
+
+        print("Expansion disabled.")
+        print("Returning original Transformer unchanged.")
+
+        return model
+
+    if not isinstance(num_new_layers, int) or num_new_layers <= 0:
+        raise ValueError("num_new_layers must be a positive integer.")
+
+    if not model.built:
+        raise ValueError(
+            "Build the original model before expanding it."
+        )
+
+    # --------------------------------------------------
+    # 2. Record original architecture
+    # --------------------------------------------------
+
+    original_layers = len(model.dec_layers)
+
+    total_layers = original_layers + num_new_layers
+
+    print(f"\nExisting layers       : {original_layers}")
+    print(f"New layers requested  : {num_new_layers}")
+    print(f"Updated model depth   : {total_layers}")
+
+    # --------------------------------------------------
+    # 3. Create expanded Transformer
+    # --------------------------------------------------
+
+    expanded_model = DecoderOnlyTransformer(
+
+        num_layers=total_layers,
+
+        d_model=model.d_model,
+
+        num_heads=model.num_heads,
+
+        dff=model.dff,
+
+        vocab_size=model.vocab_size,
+
+        maximum_position_encoding=model.maximum_position_encoding,
+
+        rate=model.rate
+
+    )
+
+    # --------------------------------------------------
+    # 4. Build expanded model
+    # --------------------------------------------------
+
+    dummy_input = tf.zeros(
+        (1, model.maximum_position_encoding),
+        dtype=tf.int32
+    )
+
+    expanded_model(
+        dummy_input,
+        training=False
+    )
+
+    # --------------------------------------------------
+    # 5. Copy original embedding weights
+    # --------------------------------------------------
+
+    expanded_model.embedding.set_weights(
+        model.embedding.get_weights()
+    )
+
+    # --------------------------------------------------
+    # 6. Copy original 13 Transformer layers
+    # --------------------------------------------------
+
+    for i in range(original_layers):
+
+        expanded_model.dec_layers[i].set_weights(
+            model.dec_layers[i].get_weights()
+        )
+
+    # --------------------------------------------------
+    # 7. Copy original LM head
+    # --------------------------------------------------
+
+    expanded_model.final_layer.set_weights(
+        model.final_layer.get_weights()
+    )
+
+    # --------------------------------------------------
+    # 8. Initialize new layers as identity transformations
+    # --------------------------------------------------
+    # This is important:
+    #
+    # Each new layer initially produces approximately
+    # its input unchanged.
+    #
+    # Therefore, adding new layers does not initially
+    # disrupt the original model's predictions.
+    #
+    # The output projections will learn during training.
+
+    for i in range(original_layers, total_layers):
+
+        layer = expanded_model.dec_layers[i]
+
+        # Attention output projection
+        layer.mha.dense.kernel.assign(
+            tf.zeros_like(layer.mha.dense.kernel)
+        )
+
+        layer.mha.dense.bias.assign(
+            tf.zeros_like(layer.mha.dense.bias)
+        )
+
+        # Final FFN projection
+        final_ffn_dense = layer.ffn.layers[-1]
+
+        final_ffn_dense.kernel.assign(
+            tf.zeros_like(final_ffn_dense.kernel)
+        )
+
+        final_ffn_dense.bias.assign(
+            tf.zeros_like(final_ffn_dense.bias)
+        )
+
+    # --------------------------------------------------
+    # 9. Freeze original architecture
+    # --------------------------------------------------
+
+    expanded_model.trainable = True
+
+    # Freeze original embeddings
+    expanded_model.embedding.trainable = False
+
+    # Freeze original 13 Transformer layers
+    for i in range(original_layers):
+
+        expanded_model.dec_layers[i].trainable = False
+
+    # Freeze original output projection
+    expanded_model.final_layer.trainable = False
+
+    # Keep newly added layers trainable
+    for i in range(original_layers, total_layers):
+
+        expanded_model.dec_layers[i].trainable = True
+
+    # --------------------------------------------------
+    # 10. Verify architecture
+    # --------------------------------------------------
+
+    print("\nOriginal weights transferred successfully.")
+
+    print("\nLayer configuration:")
+
+    for i, layer in enumerate(expanded_model.dec_layers):
+
+        status = (
+            "TRAINABLE"
+            if layer.trainable
+            else "FROZEN"
+        )
+
+        print(f"Layer {i + 1:02d} : {status}")
+
+    print("\nEmbedding       : FROZEN")
+    print("LM Head         : FROZEN")
+
+    print("\nOriginal layers : ", original_layers)
+    print("Added layers    : ", num_new_layers)
+    print("Total layers    : ", total_layers)
+
+    print(
+        "\nTrainable variables:",
+        len(expanded_model.trainable_variables)
+    )
+
+    print(
+        "Trainable parameters:",
+        sum(
+            int(tf.size(v).numpy())
+            for v in expanded_model.trainable_variables
+        )
+    )
+
+    print("\n" + "=" * 60)
+    print("       EXPANSION COMPLETED SUCCESSFULLY")
+    print("=" * 60)
+
+    return expanded_model
+
+# #-----------------------------------------------------------------------------------
+
+#-------------------------training_----------------------
+# =========================================================
+# INSTRUCTION TUNING FROM A PRETRAINED NEXT-TOKEN MODEL
+# JSONL DATASET: CONTEXT + QUESTION -> ANSWER
+# =========================================================
+
+import os
+import json
+import math
+import numpy as np
+import tensorflow as tf
+
+from transformers import BertTokenizerFast
+
+# =========================================================
+# 0. CONFIGURATION
+# =========================================================
+# Merged JSONL training dataset
+DATA_FILE = (
+    "/kaggle/input/datasets/ravckumar/context-ques-answer/merged_training.jsonl"
+)
+
+PRETRAINED_WEIGHTS = (
+    "/kaggle/input/datasets/ravckumar/context-model-nov-17/final_instruction_tuned.weights.h5"
+)
+
+# Pretrained tokenizer
+TOKENIZER_NAME_OR_PATH = "bert-base-uncased"
+
+PRETRAINED_TOKENIZER_DIR = (
+    "/kaggle/input/datasets/ravckumar/context-model-nov-17"
+)
+OUTPUT_DIR = "/kaggle/working/instruction_tuning"
+
+SEQ_LEN = 512
+TRAIN_RATIO = 0.90
+
+SEED = 42
+PER_GPU_BATCH_SIZE = 26
+
+EPOCHS = 1
+
+WARMUP_EPOCHS = 0.1
+
+INITIAL_LR1 = 8e-5
+
+MIN_LR1 = 5e-5
+
+WEIGHT_DECAY = 0.01
+
+
+# =========================================================
+# MODEL CONFIGURATION
+# These must match your existing model configuration.
+# Define/import DecoderOnlyTransformer before running.
+# =========================================================
+
+NUM_LAYERS = 31
+
+NUM_FROZEN_LAYERS = 23
+
+NUM_TRAINABLE_LAYERS = 8
+
+# These must be defined according to your original model:
+#
+# EMBED_DIM = ...
+# NUM_HEADS = ...
+# DFF = ...
+# DROPOUT = ...
+
+# =========================================================
+# OPTIMIZER CONFIGURATION
+# =========================================================
+optimizer_dir="/kaggle/input/datasets/ravckumar/context-model-nov-17"
+LOAD_OPTIMIZER_STATE = True
+
+OPTIMIZER_STATE_PREFIX = os.path.join(
+    optimizer_dir,
+    "optimizer_state"
+)
+
+
+# =========================================================
+# INITIALIZATION
+# =========================================================
+
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+np.random.seed(SEED)
+
+tf.random.set_seed(SEED)
+
+
+# =========================================================
+# 1. LOAD JSONL QUESTION-ANSWER DATA
+# =========================================================
+def extract_text(value):
+
+    if isinstance(value, str):
+
+        return value.strip()
+
+    if isinstance(value, dict):
+
+        return extract_text(
+            value.get("text", "")
+        )
+
+    if isinstance(value, list):
+
+        extracted = []
+
+        for item in value:
+
+            text = extract_text(item)
+
+            if text:
+
+                extracted.append(text)
+
+        return " ".join(extracted)
+
+    if isinstance(value, np.ndarray):
+
+        return extract_text(
+            value.tolist()
+        )
+
+    return ""
+
+
+qa_pairs = []
+
+total_lines = 0
+
+invalid_lines = 0
+
+empty_samples = 0
+
+
+with open(
+    DATA_FILE,
+    "r",
+    encoding="utf-8"
+) as f:
+
+    for line in f:
+
+        total_lines += 1
+
+        line = line.strip()
+
+        if not line:
+
+            continue
+
+        try:
+
+            item = json.loads(line)
+
+        except json.JSONDecodeError:
+
+            invalid_lines += 1
+
+            continue
+
+        if not isinstance(item, dict):
+
+            empty_samples += 1
+
+            continue
+
+        # -------------------------------------------------
+        # Extract question
+        # -------------------------------------------------
+
+        question = extract_text(
+            item.get("question", "")
+        )
+
+        # -------------------------------------------------
+        # Extract optional separate context
+        # -------------------------------------------------
+
+        context = extract_text(
+            item.get("context", "")
+        )
+
+        # If context is stored separately, combine it
+        # with the question.
+        #
+        # If question already contains Context:,
+        # do not duplicate the context.
+
+        if (
+            context
+            and not question.startswith("Context:")
+        ):
+
+            question = (
+                f"Context:\n{context}\n\n"
+                f"Question:\n{question}"
+            )
+
+        # -------------------------------------------------
+        # Extract answer text
+        # -------------------------------------------------
+
+        answer = extract_text(
+            item.get(
+                "answer",
+                item.get("answers", "")
+            )
+        )
+
+        # -------------------------------------------------
+        # Keep valid examples
+        # -------------------------------------------------
+
+        if question and answer:
+
+            qa_pairs.append(
+                (question, answer)
+            )
+
+        else:
+
+            empty_samples += 1
+
+
+if len(qa_pairs) < 2:
+
+    raise ValueError(
+        "At least two valid question-answer pairs "
+        "are required."
+    )
+
+
+print("\n====================================")
+print("JSONL DATASET SUMMARY")
+print("====================================")
+
+print("Total JSONL lines:", total_lines)
+
+print("Valid QA pairs:", len(qa_pairs))
+
+print("Invalid JSON lines:", invalid_lines)
+
+print("Empty samples:", empty_samples)
+
+
+print("\nFirst training example:")
+
+print("\nQUESTION:")
+
+print(qa_pairs[0][0])
+
+print("\nANSWER:")
+
+print(qa_pairs[0][1])
+
+# =========================================================
+# 2. LOAD PRETRAINED TOKENIZER
+# =========================================================
+
+if os.path.isdir(PRETRAINED_TOKENIZER_DIR):
+
+    tokenizer = BertTokenizerFast.from_pretrained(
+        PRETRAINED_TOKENIZER_DIR,
+        local_files_only=True
+    )
+
+    print(
+        "Pretrained tokenizer loaded successfully."
+    )
+
+else:
+
+    tokenizer = BertTokenizerFast.from_pretrained(
+        TOKENIZER_NAME_OR_PATH
+    )
+
+    print(
+        "Pretrained tokenizer directory unavailable."
+    )
+
+    print(
+        "Loaded bert-base-uncased tokenizer instead."
+    )
+
+
+# IMPORTANT:
+# Do not add new special tokens.
+# The pretrained model must retain its original vocabulary.
+
+vocab_size = tokenizer.vocab_size
+
+PAD_ID = tokenizer.pad_token_id
+
+print("Vocabulary size:", vocab_size)
+
+print("Padding token ID:", PAD_ID)
+
+
+# =========================================================
+# 3. ENCODE INSTRUCTION-TUNING EXAMPLES
+# =========================================================
+
+# Training sequence:
+#
+# Question: Context:
+# Complete context...
+#
+# Question:
+# Actual question...
+#
+# Answer: Natural-language answer...
+# End of answer.
+#
+# Only answer tokens and END_IDS contribute to loss.
+
+
+QUESTION_PREFIX_IDS = tokenizer.encode(
+    "Question: ",
+    add_special_tokens=False
+)
+
+
+ANSWER_PREFIX_IDS = tokenizer.encode(
+    "\nAnswer: ",
+    add_special_tokens=False
+)
+
+
+END_IDS = tokenizer.encode(
+    "\nEnd of answer.",
+    add_special_tokens=False
+)
+
+
+def encode_qa(
+    question,
+    answer,
+    seq_len
+):
+
+    # -----------------------------------------------------
+    # Tokenize question/context
+    # -----------------------------------------------------
+
+    question_ids = tokenizer.encode(
+        question,
+        add_special_tokens=False
+    )
+
+    # -----------------------------------------------------
+    # Tokenize answer
+    # -----------------------------------------------------
+
+    answer_ids = tokenizer.encode(
+        answer,
+        add_special_tokens=False
+    )
+
+    # -----------------------------------------------------
+    # Reserve space for prefixes, ending phrase,
+    # and at least one answer token.
+    # -----------------------------------------------------
+
+    fixed_overhead = (
+        len(QUESTION_PREFIX_IDS)
+        + len(ANSWER_PREFIX_IDS)
+        + len(END_IDS)
+    )
+
+    max_question_tokens = max(
+        0,
+        seq_len - fixed_overhead - 1
+    )
+
+    # Truncate question/context if necessary.
+
+    question_ids = question_ids[
+        :max_question_tokens
+    ]
+
+    # -----------------------------------------------------
+    # Build question prefix
+    # -----------------------------------------------------
+
+    prefix_ids = (
+        QUESTION_PREFIX_IDS
+        + question_ids
+        + ANSWER_PREFIX_IDS
+    )
+
+    # -----------------------------------------------------
+    # Reserve remaining space for answer.
+    # -----------------------------------------------------
+
+    answer_capacity = (
+        seq_len
+        - len(prefix_ids)
+        - len(END_IDS)
+    )
+
+    answer_ids = answer_ids[
+        :answer_capacity
+    ]
+
+    if not answer_ids:
+
+        return None
+
+    # -----------------------------------------------------
+    # Complete sequence
+    # -----------------------------------------------------
+
+    token_ids = (
+        prefix_ids
+        + answer_ids
+        + END_IDS
+    )
+
+    # -----------------------------------------------------
+    # Next-token prediction
+    # -----------------------------------------------------
+
+    input_ids = token_ids[:-1]
+
+    target_ids = token_ids[1:]
+
+    # -----------------------------------------------------
+    # Identify first answer target position
+    # -----------------------------------------------------
+
+    first_answer_target = (
+        len(prefix_ids) - 1
+    )
+
+    # -----------------------------------------------------
+    # Answer-only loss weights
+    # -----------------------------------------------------
+
+    token_weights = np.zeros(
+        len(target_ids),
+        dtype=np.float32
+    )
+
+    # Only answer tokens and ending phrase
+    # contribute to training loss.
+
+    token_weights[
+        first_answer_target:
+    ] = 1.0
+
+    # -----------------------------------------------------
+    # Padding
+    # -----------------------------------------------------
+
+    padding_length = (
+        (seq_len - 1) - len(input_ids)
+    )
+
+    input_ids += (
+        [PAD_ID] * padding_length
+    )
+
+    target_ids += (
+        [PAD_ID] * padding_length
+    )
+
+    token_weights = np.pad(
+        token_weights,
+        (0, padding_length)
+    )
+
+    return (
+        input_ids,
+        target_ids,
+        token_weights
+    )
+
+
+# =========================================================
+# 4. BUILD TRAINING ARRAYS
+# =========================================================
+
+examples = []
+
+qa_pairs=qa_pairs[150000:180000]
+
+for question, answer in qa_pairs:
+
+    encoded = encode_qa(
+        question,
+        answer,
+        SEQ_LEN
+    )
+
+    if encoded is not None:
+
+        examples.append(encoded)
+
+
+if len(examples) < 2:
+
+    raise ValueError(
+        "Not enough valid examples after tokenization."
+    )
+
+
+inputs = np.asarray(
+    [
+        example[0]
+        for example in examples
+    ],
+    dtype=np.int32
+)
+
+
+targets = np.asarray(
+    [
+        example[1]
+        for example in examples
+    ],
+    dtype=np.int32
+)
+
+
+sample_weights = np.asarray(
+    [
+        example[2]
+        for example in examples
+    ],
+    dtype=np.float32
+)
+
+
+print("\n====================================")
+print("ENCODED DATASET")
+print("====================================")
+
+print("Encoded examples:", len(examples))
+
+print("Input shape:", inputs.shape)
+
+print("Target shape:", targets.shape)
+
+print("Weights shape:", sample_weights.shape)
+
+print(
+    "Average supervised tokens:",
+    round(
+        float(
+            sample_weights.sum(axis=1).mean()
+        ),
+        2
+    )
+)
+
+
+# =========================================================
+# 5. TRAIN / VALIDATION SPLIT
+# =========================================================
+
+indices = np.random.permutation(
+    len(inputs)
+)
+
+split_index = int(
+    len(indices) * TRAIN_RATIO
+)
+
+# Ensure both datasets contain at least one example.
+
+split_index = min(
+    max(split_index, 1),
+    len(indices) - 1
+)
+
+
+train_indices = indices[
+    :split_index
+]
+
+val_indices = indices[
+    split_index:
+]
+
+
+train_inputs = inputs[
+    train_indices
+]
+
+train_targets = targets[
+    train_indices
+]
+
+train_weights = sample_weights[
+    train_indices
+]
+
+
+val_inputs = inputs[
+    val_indices
+]
+
+val_targets = targets[
+    val_indices
+]
+
+val_weights = sample_weights[
+    val_indices
+]
+
+
+print("\nTraining examples:", len(train_inputs))
+
+print("Validation examples:", len(val_inputs))
+
+
+# =========================================================
+# 6. DISTRIBUTED TRAINING DATASETS
+# =========================================================
+
+strategy = tf.distribute.MirroredStrategy()
+
+NUM_GPUS = strategy.num_replicas_in_sync
+
+
+GLOBAL_BATCH_SIZE = (
+    PER_GPU_BATCH_SIZE * NUM_GPUS
+)
+
+
+train_dataset = tf.data.Dataset.from_tensor_slices(
+    (
+        train_inputs,
+        train_targets,
+        train_weights
+    )
+)
+
+
+train_dataset = (
+
+    train_dataset
+
+    .shuffle(
+        len(train_inputs),
+        seed=SEED,
+        reshuffle_each_iteration=True
+    )
+
+    .batch(
+        GLOBAL_BATCH_SIZE,
+        drop_remainder=True
+    )
+
+    .prefetch(
+        tf.data.AUTOTUNE
+    )
+)
+
+val_dataset = tf.data.Dataset.from_tensor_slices(
+    (
+        val_inputs,
+        val_targets,
+        val_weights
+    )
+)
+
+val_dataset = (
+    val_dataset
+    .batch(
+        GLOBAL_BATCH_SIZE,
+        drop_remainder=True
+    )
+    .prefetch(tf.data.AUTOTUNE)
+)
+
+# val_dataset = tf.data.Dataset.from_tensor_slices(
+#     (
+#         val_inputs,
+#         val_targets,
+#         val_weights
+#     )
+# )
+
+
+# val_dataset = (
+
+#     val_dataset
+
+#     .batch(
+#         GLOBAL_BATCH_SIZE,
+#         drop_remainder=False
+#     )
+
+#     .prefetch(
+#         tf.data.AUTOTUNE
+#     )
+# )
+
+
+steps_per_epoch = len(train_dataset)
+
+validation_steps = len(val_dataset)
+
+
+if steps_per_epoch == 0:
+
+    raise ValueError(
+        "No training batches. Reduce the batch size "
+        "or add more training examples."
+    )
+
+
+total_steps = (
+    steps_per_epoch * EPOCHS
+)
+
+
+warmup_steps = int(
+    steps_per_epoch * WARMUP_EPOCHS
+)
+
+
+print("\n====================================")
+print("DISTRIBUTED TRAINING")
+print("====================================")
+
+print("Number of GPUs:", NUM_GPUS)
+
+print("Per-GPU batch size:", PER_GPU_BATCH_SIZE)
+
+print("Global batch size:", GLOBAL_BATCH_SIZE)
+
+print("Steps per epoch:", steps_per_epoch)
+
+print("Validation steps:", validation_steps)
+
+print("Total steps:", total_steps)
+
+print("Warmup steps:", warmup_steps)
+
+
+# =========================================================
+# 7. WARMUP + COSINE LEARNING-RATE SCHEDULE
+# =========================================================
+
+class WarmupCosineDecay(
+    tf.keras.optimizers.schedules.LearningRateSchedule
+):
+
+    def __init__(
+        self,
+        initial_lr,
+        min_lr,
+        warmup_steps,
+        total_steps
+    ):
+
+        super().__init__()
+
+        self.initial_lr = float(initial_lr)
+
+        self.min_lr = float(min_lr)
+
+        self.warmup_steps = int(
+            warmup_steps
+        )
+
+        self.total_steps = int(
+            total_steps
+        )
+
+
+    def __call__(self, step):
+
+        step = tf.cast(
+            step,
+            tf.float32
+        )
+
+        warmup_steps = tf.cast(
+            self.warmup_steps,
+            tf.float32
+        )
+
+        total_steps = tf.cast(
+            self.total_steps,
+            tf.float32
+        )
+
+
+        warmup_lr = (
+
+            self.initial_lr
+
+            * (step + 1.0)
+
+            / tf.maximum(
+                warmup_steps,
+                1.0
+            )
+        )
+
+
+        progress = (
+
+            (step - warmup_steps)
+
+            / tf.maximum(
+                total_steps - warmup_steps,
+                1.0
+            )
+        )
+
+
+        progress = tf.clip_by_value(
+            progress,
+            0.0,
+            1.0
+        )
+
+
+        cosine_lr = (
+
+            self.min_lr
+
+            + 0.5
+
+            * (
+                self.initial_lr
+                - self.min_lr
+            )
+
+            * (
+                1.0
+                + tf.cos(math.pi * progress)
+            )
+        )
+
+
+        return tf.where(
+            step < warmup_steps,
+            warmup_lr,
+            cosine_lr
+        )
+
+
+    def get_config(self):
+
+        return {
+
+            "initial_lr": self.initial_lr,
+
+            "min_lr": self.min_lr,
+
+            "warmup_steps": self.warmup_steps,
+
+            "total_steps": self.total_steps
+        }
+
+
+lr_schedule = WarmupCosineDecay(
+
+    initial_lr=INITIAL_LR1,
+
+    min_lr=MIN_LR1,
+
+    warmup_steps=warmup_steps,
+
+    total_steps=total_steps
+)
+
+
+# =========================================================
+# 8. CONFIGURE TRAINABLE LAYERS
+# =========================================================
+
+def configure_trainable_layers(model):
+
+    # Keep the model trainable at the top level.
+    model.trainable = True
+
+    # Freeze embedding.
+    model.embedding.trainable = False
+
+    # Freeze all decoder layers except the last 8.
+    NUM_TRAINABLE_LAYERS = 8
+    NUM_FROZEN_LAYERS = NUM_LAYERS - NUM_TRAINABLE_LAYERS
+
+    for i in range(NUM_FROZEN_LAYERS):
+        model.dec_layers[i].trainable = False
+
+    # Unfreeze the last 8 decoder layers.
+    for i in range(NUM_FROZEN_LAYERS, NUM_LAYERS):
+        model.dec_layers[i].trainable = True
+
+    # Freeze final language-model head.
+    model.final_layer.trainable = False
+
+    print("\nLayer trainability:")
+
+    for i, layer in enumerate(model.dec_layers):
+
+        status = (
+            "TRAINABLE"
+            if layer.trainable
+            else "FROZEN"
+        )
+
+        print(f"Layer {i + 1:02d}: {status}")
+
+    print("\nEmbedding: FROZEN")
+    print("LM head: FROZEN")
+    print(f"Trainable decoder layers: {NUM_TRAINABLE_LAYERS}")
+    print(f"Frozen decoder layers: {NUM_FROZEN_LAYERS}")
+# =========================================================
+# 9. BUILD MODEL AND LOAD PRETRAINED WEIGHTS
+# =========================================================
+
+with strategy.scope():
+
+    # -----------------------------------------------------
+    # CREATE 26-LAYER TRANSFORMER
+    # -----------------------------------------------------
+
+    model = DecoderOnlyTransformer(
+
+        num_layers=NUM_LAYERS,
+
+        d_model=EMBED_DIM,
+
+        num_heads=NUM_HEADS,
+
+        dff=DFF,
+
+        vocab_size=vocab_size,
+
+        maximum_position_encoding=SEQ_LEN,
+
+        rate=DROPOUT
+    )
+
+
+    # -----------------------------------------------------
+    # BUILD MODEL VARIABLES
+    # -----------------------------------------------------
+
+    dummy_input = tf.zeros(
+        (1, SEQ_LEN - 1),
+        dtype=tf.int32
+    )
+
+
+    dummy_output = model(
+        dummy_input,
+        training=False
+    )
+
+
+    print(
+        "Model output shape:",
+        dummy_output.shape
+    )
+
+
+    # -----------------------------------------------------
+    # VERIFY ARCHITECTURE
+    # -----------------------------------------------------
+
+    if len(model.dec_layers) != NUM_LAYERS:
+
+        raise ValueError(
+
+            f"Expected {NUM_LAYERS} layers, "
+
+            f"but found {len(model.dec_layers)}."
+        )
+
+
+    # -----------------------------------------------------
+    # LOAD PRETRAINED WEIGHTS
+    # -----------------------------------------------------
+
+    if not os.path.exists(
+        PRETRAINED_WEIGHTS
+    ):
+
+        raise FileNotFoundError(
+            f"Pretrained weights not found: "
+            f"{PRETRAINED_WEIGHTS}"
+        )
+
+
+    model.load_weights(
+        PRETRAINED_WEIGHTS
+    )
+
+
+    print(
+        "Pretrained model weights loaded successfully."
+    )
+
+
+    # -----------------------------------------------------
+    # FREEZE FIRST 13 LAYERS
+    # TRAIN LAST 13 LAYERS
+    # -----------------------------------------------------
+
+    configure_trainable_layers(
+        model
+    )
+
+
+    # -----------------------------------------------------
+    # MODEL PARAMETER SUMMARY
+    # -----------------------------------------------------
+
+    total_params = model.count_params()
+
+
+    trainable_params = sum(
+
+        int(
+            tf.size(v).numpy()
+        )
+
+        for v in model.trainable_variables
+    )
+
+
+    non_trainable_params = (
+
+        total_params - trainable_params
+    )
+
+
+    print("\n====================================")
+
+    print("MODEL PARAMETER SUMMARY")
+
+    print("====================================")
+
+    print(
+        "Total layers:",
+        len(model.dec_layers)
+    )
+
+    print(
+        "Total parameters:",
+        total_params
+    )
+
+    print(
+        "Trainable parameters:",
+        trainable_params
+    )
+
+    print(
+        "Non-trainable parameters:",
+        non_trainable_params
+    )
+
+
+    # -----------------------------------------------------
+    # LOSS FUNCTION
+    # -----------------------------------------------------
+
+    loss_fn = (
+        tf.keras.losses.SparseCategoricalCrossentropy(
+            from_logits=True
+        )
+    )
+
+
+    # -----------------------------------------------------
+    # FRESH OPTIMIZER
+    # -----------------------------------------------------
+
+    optimizer = tf.keras.optimizers.AdamW(
+
+        learning_rate=lr_schedule,
+
+        weight_decay=WEIGHT_DECAY
+    )
+
+
+    # -----------------------------------------------------
+    # COMPILE MODEL
+    # -----------------------------------------------------
+
+    model.compile(
+
+        optimizer=optimizer,
+
+        loss=loss_fn,
+
+        weighted_metrics=[
+
+            tf.keras.metrics.SparseCategoricalAccuracy(
+                name="accuracy"
+            )
+        ]
+    )
+
+
+    # -----------------------------------------------------
+    # BUILD OPTIMIZER SLOTS
+    # -----------------------------------------------------
+
+    if hasattr(optimizer, "build"):
+
+        optimizer.build(
+            model.trainable_variables
+        )
+
+# ---------------------------------------------------------
+# RESTORE OPTIMIZER STATE
+# ---------------------------------------------------------
+
+    if LOAD_OPTIMIZER_STATE:
+    
+        optimizer_index_path = (
+            OPTIMIZER_STATE_PREFIX + ".index"
+        )
+    
+        if not os.path.exists(optimizer_index_path):
+    
+            raise FileNotFoundError(
+                f"Optimizer checkpoint not found: "
+                f"{OPTIMIZER_STATE_PREFIX}"
+            )
+    
+        optimizer_checkpoint = tf.train.Checkpoint(
+            optimizer=optimizer
+        )
+    
+        optimizer_status = optimizer_checkpoint.read(
+            OPTIMIZER_STATE_PREFIX
+        )
+    
+        # Verify that existing optimizer variables matched.
+        optimizer_status.assert_existing_objects_matched()
+    
+        print("Optimizer state restored successfully!")
+
+
+    # -----------------------------------------------------
+    # OPTIONAL OPTIMIZER RESTORE
+    # -----------------------------------------------------
+
+    # if LOAD_OPTIMIZER_STATE:
+
+    #     optimizer_index_path = (
+    #         OPTIMIZER_STATE_PREFIX + ".index"
+    #     )
+
+
+    #     if not os.path.exists(
+    #         optimizer_index_path
+    #     ):
+
+    #         raise FileNotFoundError(
+
+    #             "Optimizer state was requested, "
+
+    #             "but no saved optimizer state was found at: "
+
+    #             f"{OPTIMIZER_STATE_PREFIX}"
+    #         )
+
+
+    #     optimizer_status = tf.train.Checkpoint(
+    #         optimizer=optimizer
+    #     ).restore(
+    #         OPTIMIZER_STATE_PREFIX
+    #     )
+
+
+    #     optimizer_status.assert_existing_objects_matched()
+
+
+    #     print(
+    #         "Optimizer state restored:",
+    #         OPTIMIZER_STATE_PREFIX
+    #     )
+
+
+    # print(
+    #     "\nModel compiled successfully."
+    # )
+
+
+
+
+# ---------------------------------------------------------
+# MODEL SUMMARY
+# ---------------------------------------------------------
+
+model.summary()
+
+
+# =========================================================
+# 10. MODEL WEIGHTS CALLBACK
+# =========================================================
+
+checkpoint_path = os.path.join(
+    OUTPUT_DIR,
+    "instruction_tuned.weights.h5"
+)
+
+
+checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+
+    checkpoint_path,
+
+    save_weights_only=True,
+
+    monitor="val_loss",
+
+    mode="min",
+
+    save_best_only=True,
+
+    verbose=1
+)
+
+
+# =========================================================
+# 11. INSTRUCTION TUNING
+# =========================================================
+
+print("\n====================================")
+
+print("STARTING INSTRUCTION TUNING")
+
+print("====================================")
+
+
+history = model.fit(
+
+    train_dataset,
+
+    validation_data=val_dataset,
+
+    epochs=EPOCHS,
+
+    callbacks=[
+        checkpoint_cb
+    ]
+)
+
+
+# =========================================================
+# 12. EVALUATION
+# =========================================================
+
+print("\n====================================")
+
+print("FINAL VALIDATION")
+
+print("====================================")
+
+
+results = model.evaluate(
+
+    val_dataset,
+
+    return_dict=True,
+
+    verbose=1
+)
+
+
+for name, value in results.items():
+
+    print(
+        f"{name}: {value:.6f}"
+    )
+
+
+# =========================================================
+# 13. SAVE FINAL EPOCH WEIGHTS
+# =========================================================
+
+final_weights_path = os.path.join(
+
+    OUTPUT_DIR,
+
+    "final_instruction_tuned.weights.h5"
+)
+
+
+model.save_weights(
+    final_weights_path
+)
+
+
+print(
+    "Final weights saved:",
+    final_weights_path
+)
+
+
+# ---------------------------------------------------------
+# SAVE OPTIMIZER STATE SEPARATELY
+# ---------------------------------------------------------
+
+tf.train.Checkpoint(
+    optimizer=optimizer
+).write(
+    OPTIMIZER_STATE_PREFIX
+)
+
+
+print(
+    "Optimizer state saved:",
+    OPTIMIZER_STATE_PREFIX
+)
+
+
+# ---------------------------------------------------------
+# SAVE TOKENIZER
+# ---------------------------------------------------------
+
+tokenizer.save_pretrained(
+
+    os.path.join(
+        OUTPUT_DIR,
+        "tokenizer"
+    )
+)
+
+
+print("Tokenizer saved.")
+
+
+# =========================================================
+# 14. GENERATE ANSWERS
+# =========================================================
+
+def generate_answer(
+
+    model,
+
+    tokenizer,
+
+    question,
+
+    seq_len=SEQ_LEN,
+
+    max_gen=150
+
+):
+
+    # The question may contain:
+    # Context + Question
+
+    prompt = (
+        f"Question: {question}\n"
+        f"Answer:"
+    )
+
+
+    token_ids = tokenizer.encode(
+
+        prompt,
+
+        add_special_tokens=False
+    )
+
+
+    if not token_ids:
+
+        raise ValueError(
+            "Question produced no tokens."
+        )
+
+
+    # Retain the most recent context.
+
+    token_ids = token_ids[
+        -(seq_len - 1):
+    ]
+
+
+    input_seq = tf.constant(
+
+        [token_ids],
+
+        dtype=tf.int32
+    )
+
+    generated_ids = []
+
+
+    for _ in range(max_gen):
+
+        logits = model(
+
+            input_seq,
+
+            training=False
+        )
+
+
+        next_id = tf.argmax(
+
+            logits[:, -1, :],
+
+            axis=-1,
+
+            output_type=tf.int32
+        )
+
+
+        next_id_value = int(
+            next_id.numpy()[0]
+        )
+
+
+        generated_ids.append(
+            next_id_value
+        )
+
+
+        # Detect ordinary-text ending phrase.
+
+        if (
+
+            len(generated_ids) >= len(END_IDS)
+
+            and generated_ids[
+                -len(END_IDS):
+            ] == END_IDS
+
+        ):
+
+            generated_ids = generated_ids[
+                :-len(END_IDS)
+            ]
+
+            break
+
+
+        input_seq = tf.concat(
+
+            [
+
+                input_seq,
+
+                tf.reshape(
+                    next_id,
+                    (1, 1)
+                )
+
+            ],
+
+            axis=1
+        )
+
+
+        if input_seq.shape[1] > seq_len - 1:
+
+            input_seq = input_seq[
+                :, -(seq_len - 1):
+            ]
+
+
+    return tokenizer.decode(
+
+        generated_ids,
+
+        skip_special_tokens=True
+
+    ).strip()
+
+
+# =========================================================
+# 15. TEST THE INSTRUCTION-TUNED MODEL
+# =========================================================
+
+context = """
+Google App Engine is a platform as a service
+offered by Google. It allows developers to build
+and deploy applications without managing the
+underlying infrastructure.
+"""
+
+question = (
+    "What is Google App Engine and what does it provide?"
+)
+
+
+combined_question = (
+
+    f"Context:\n{context}\n\n"
+
+    f"Question:\n{question}"
+)
+
+
+answer = generate_answer(
+
+    model,
+
+    tokenizer,
+
+    combined_question,
+
+    max_gen=150
+)
+
+
+print("\n====================================")
+
+print("MODEL GENERATION TEST")
+
+print("====================================")
+
+
+print("\nContext:")
+
+print(context)
+
+
+print("\nQuestion:")
+
+print(question)
+
+
+print("\nGenerated answer:")
+
+print(answer)
+
+
+print("\n====================================")
+
+print("INSTRUCTION TUNING COMPLETED")
+
+print("====================================")
+
+
